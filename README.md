@@ -42,7 +42,7 @@ npm run test:e2e  # 18 end-to-end tests in a real browser
 | `src/demo-data.js`, `src/export.js` | Synthetic demo records; CSV and JSON export |
 | `server/server.js` | Reference backend with no dependencies: static serving, validated submissions, token-protected admin API |
 | `tests/` | Unit, server, and end-to-end tests |
-| `docs/` | Experimental logic, data dictionary, storage limitations, approval checklist, testing summary |
+| `docs/` | Experimental logic, data dictionary, storage limitations, hosting, approval checklist, testing summary |
 
 ## How the experiment works
 
@@ -65,6 +65,10 @@ AGECHECK_DATA_DIR=server/data                # gitignored
 AGECHECK_ALLOWED_ORIGIN=https://...          # only if the static app is hosted elsewhere
 HOST=127.0.0.1 PORT=8080
 ```
+
+## Hosting
+
+See [docs/HOSTING.md](docs/HOSTING.md). GitHub Pages can host the static app (preview mode and in-person local-device sessions) but cannot run the server, so collecting from participants' own devices needs the reference server on a host that runs Node with persistent storage.
 
 ## Before collection
 
