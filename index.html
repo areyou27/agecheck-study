@@ -20,10 +20,24 @@
       </div>
       <div class="header-right" id="header-right"></div>
     </header>
-    <main id="app" aria-live="polite">
+    <!-- Shown only when the participant's progress could not be saved. -->
+    <div class="sync-status" id="sync-status" hidden></div>
+    <main id="app" tabindex="-1">
       <div class="card"><p>Loading…</p></div>
     </main>
     <footer>No camera, microphone, facial images, or government IDs are used by this app.</footer>
+
+    <!-- Withdrawal confirmation. A modal dialog: while it is open the rest of
+         the page is inactive and keyboard focus stays inside it. -->
+    <dialog class="dialog" id="withdraw-dialog" aria-labelledby="withdraw-title" aria-describedby="withdraw-body">
+      <h2 id="withdraw-title"></h2>
+      <div id="withdraw-body"></div>
+      <div class="actions">
+        <button type="button" class="btn btn-secondary" id="withdraw-cancel"></button>
+        <button type="button" class="btn" id="withdraw-confirm"></button>
+      </div>
+    </dialog>
+
     <script type="module" src="src/app.js"></script>
   </body>
 </html>

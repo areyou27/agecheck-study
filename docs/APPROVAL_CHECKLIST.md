@@ -12,7 +12,7 @@ The app ships in preview mode and cannot collect research data until every item 
 - [ ] Withdrawal procedure, including how a participant uses the response code to request deletion and by what date.
 - [ ] Expected duration.
 
-Research mode cannot be activated while any `[PLACEHOLDER]` remains in these fields.
+Research mode cannot be activated while any of these fields is empty or still contains a `[PLACEHOLDER]`. The same goes for the parental permission note, the assent statement, and the recruitment criteria statement. The app does not fill any of them in for you.
 
 ## Decisions that need approval
 
@@ -20,7 +20,7 @@ Research mode cannot be activated while any `[PLACEHOLDER]` remains in these fie
 - [ ] **Recruitment criteria statement** shown as the checkbox on the eligibility screen (default refers to the approved Prosper-area recruitment process).
 - [ ] **Parental permission process** for minors, handled entirely outside the app. The app states that checking a box is not a substitute.
 - [ ] **Recruitment codes.** Off by default. If used, they must not contain names or student IDs, and permission records that use them must be kept separately from the experimental data.
-- [ ] **Withdrawal policy.** Default: a participant who withdraws mid-session leaves only the fact of withdrawal, the condition, and the step reached; everything else is coded `withheld`. The alternative keeps partial responses marked `withdrawn`. Also decide whether withdrawn participants count in the denominator of the primary outcome.
+- [ ] **Withdrawal policy.** There is no default: it must be chosen in the dashboard before activation. Either a participant who withdraws mid-session leaves only the fact of withdrawal, the condition, and the step reached (everything else is coded `withheld`), or partial responses are kept, marked `withdrawn`. The app, the browser's stores, and the server all apply the choice. Also decide whether withdrawn participants count in the denominator of the primary outcome; the dashboard shows both.
 - [ ] **Optional demographics.** Off by default. Enable only if justified by the research plan. Comparisons on these items within a scripted simulation say nothing about real algorithmic bias.
 - [ ] **Storage configuration.** Local-device (in-person on a researcher-controlled device) or remote endpoint (the reference server). See the limitations document.
 - [ ] **Hosting and logging.** Identify what the host logs (IP addresses, timestamps) and for how long. Adjust the study information accordingly.
@@ -41,8 +41,8 @@ Research mode cannot be activated while any `[PLACEHOLDER]` remains in these fie
 ## Final steps before the first participant
 
 1. Fill every placeholder and save in the dashboard.
-2. Run "Check activation requirements" until it reports that all requirements are met.
+2. Run "Check activation requirements" until it reports that all requirements are met. Checking does not discard anything you have typed.
 3. Activate research mode, then download `study.config.json` or push it to the server.
-4. Deploy, open the participant link on a device that is not the researcher's, and confirm the header shows "Research mode" and the dashboard shows the test record under research data.
+4. Deploy, open the participant link on a device that is not the researcher's, and confirm the header shows "Research mode" and the dashboard shows the test record under research data after Refresh records. If the page says it is not available, the deployed configuration failed a check; the dashboard lists which.
 5. Delete the test record by its response code.
 6. Confirm with the supervisor that the deployed wording matches the approved wording.

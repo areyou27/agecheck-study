@@ -4,6 +4,10 @@
 //   1. Serves the static app (index.html, researcher.html, styles.css, src/).
 //   2. In research mode with a remote endpoint, accepts validated record
 //      submissions and gives the researcher authenticated access to them.
+//      It accepts nothing until a valid research configuration has been
+//      deployed to it, and it applies the same rules as the browser's stores
+//      when a record arrives twice or out of order: newer progress wins, a
+//      late save never undoes it, and a withdrawal replaces everything.
 //
 // Secrets come from environment variables and never reach the frontend:
 //   AGECHECK_SUBMIT_TOKEN   shared token participants' browsers send with a
@@ -28,8 +32,8 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 
-import { validateRecord } from "../src/data-dictionary.js";
-import { activationProblems, mergeConfig, DEFAULT_STUDY_CONFIG } from "../src/study-config.js";
+import { validateRecord, resolveSave } from "../src/data-dictionary.js";
+import { activationProblems, validateConfig, parseConfig, retainsPartialResponses, DEFAULT_STUDY_CONFIG } from "../src/study-config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -77,6 +81,35 @@ export function createApp(options = {}) {
     }
   }
 
+  /** The stored records. A file that exists but cannot be read is an error, never "no records". */
+  async function readRecords() {
+    let text;
+    try {
+      text = await fsp.readFile(recordsFile, "utf8");
+    } catch (err) {
+      if (err && err.code === "ENOENT") return {};
+      throw new Error("records unreadable");
+    }
+    try {
+      const map = JSON.parse(text);
+      if (!map || typeof map !== "object" || Array.isArray(map)) throw new Error("shape");
+      return map;
+    } catch {
+      throw new Error("records unreadable");
+    }
+  }
+
+  /**
+   * The configuration deployed to this server, checked every time it is used.
+   * Returns { present, config, problems }.
+   */
+  async function deployedConfig() {
+    const raw = await readJson(configFile, null);
+    if (!raw) return { present: false, config: null, problems: ["No configuration is deployed."] };
+    const parsed = parseConfig(raw);
+    return { present: true, config: parsed.config, problems: parsed.problems };
+  }
+
   async function writeJsonAtomic(file, value) {
     const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
     await fsp.writeFile(tmp, JSON.stringify(value, null, 2), { mode: 0o600 });
@@ -86,7 +119,7 @@ export function createApp(options = {}) {
   /** Serialize record writes so concurrent submissions cannot clobber each other. */
   function withRecords(fn) {
     const run = writing.then(async () => {
-      const map = await readJson(recordsFile, {});
+      const map = await readRecords();
       const result = await fn(map);
       if (result && result.write) await writeJsonAtomic(recordsFile, map);
       return result ? result.value : undefined;
@@ -183,6 +216,14 @@ export function createApp(options = {}) {
     if (!timingSafeEqual(req.headers["x-study-token"] || "", submitToken)) {
       return send(res, 401, { error: "This submission was not accepted (invalid study token)." });
     }
+    // Nothing is accepted until a valid research configuration is deployed here.
+    const deployed = await deployedConfig();
+    if (!deployed.present) {
+      return send(res, 503, { error: "This server is not accepting records: no study configuration has been deployed to it." });
+    }
+    if (!deployed.config || deployed.config.mode !== "research" || deployed.problems.length) {
+      return send(res, 503, { error: "This server is not accepting records: the deployed configuration is not a valid research configuration." });
+    }
     let record;
     try {
       record = JSON.parse(await readBody(req));
@@ -193,29 +234,19 @@ export function createApp(options = {}) {
     const problems = validateRecord(record);
     if (record && record.record_kind !== "research") problems.push("record_kind must be research");
     if (problems.length) return send(res, 422, { error: "The submission did not match the data dictionary.", problems: problems.slice(0, 10) });
-    const serverConfig = await readJson(configFile, null);
-    if (serverConfig && serverConfig.mode !== "research") {
-      return send(res, 409, { error: "The server configuration is not in research mode." });
+    if (record.study_version !== deployed.config.studyVersion) {
+      return send(res, 409, { error: `Study version mismatch (server is on ${deployed.config.studyVersion}).` });
     }
-    if (serverConfig && serverConfig.studyVersion && record.study_version !== serverConfig.studyVersion) {
-      return send(res, 409, { error: `Study version mismatch (server is on ${serverConfig.studyVersion}).` });
-    }
+    // The same rule as the browser's stores: newer progress replaces older, a
+    // late save never undoes it, and a withdrawal replaces everything. The
+    // deployed retention policy is applied to every withdrawn record here, so
+    // it holds whatever the sending browser did.
+    const retainWithdrawn = retainsPartialResponses(deployed.config);
     const outcome = await withRecords(async (map) => {
-      const existing = map[record.response_id];
-      if (existing) {
-        const sameStatus = existing.submission_status === record.submission_status;
-        if (existing.submission_status === "submitted" && record.submission_status !== "submitted") {
-          return { write: false, value: { ok: true, duplicate: true } };
-        }
-        if (existing.submission_status === "withdrawn" && record.submission_status !== "withdrawn") {
-          return { write: false, value: { ok: true, duplicate: true } };
-        }
-        if (sameStatus && JSON.stringify(existing) === JSON.stringify(record)) {
-          return { write: false, value: { ok: true, duplicate: true } };
-        }
-      }
-      map[record.response_id] = record;
-      return { write: true, value: { ok: true, duplicate: Boolean(existing) } };
+      const decision = resolveSave(map[record.response_id], record, { retainWithdrawn });
+      const write = decision.outcome === "created" || decision.outcome === "updated";
+      if (write) map[record.response_id] = decision.record;
+      return { write, value: { ok: true, outcome: decision.outcome, duplicate: decision.outcome !== "created" } };
     });
     return send(res, 200, outcome);
   }
@@ -225,7 +256,7 @@ export function createApp(options = {}) {
     if (!isAdmin(req)) return send(res, 401, { error: "Unauthorized." });
 
     if (pathname === "/api/admin/records" && req.method === "GET") {
-      const map = await readJson(recordsFile, {});
+      const map = await readRecords();
       return send(res, 200, { records: Object.values(map) });
     }
     const del = pathname.match(/^\/api\/admin\/records\/([A-Z2-9]{4}-[A-Z2-9]{4})$/);
@@ -248,26 +279,36 @@ export function createApp(options = {}) {
       return send(res, 200, { config: cfg });
     }
     if (pathname === "/api/admin/config" && req.method === "PUT") {
-      let cfg;
+      let parsed;
       try {
-        cfg = mergeConfig(JSON.parse(await readBody(req)));
-      } catch {
+        parsed = parseConfig(JSON.parse(await readBody(req)));
+      } catch (err) {
+        if (err && err.message === "too large") throw err;
         return send(res, 400, { error: "The configuration could not be read." });
       }
-      const map = await readJson(recordsFile, {});
-      const existing = await readJson(configFile, null);
+      if (!parsed.config) return send(res, 400, { error: "That is not a study configuration.", problems: parsed.problems });
+      const cfg = parsed.config;
+      const structure = validateConfig(cfg);
+      if (structure.length) return send(res, 422, { error: "The configuration is not valid.", problems: structure });
+      const map = await readRecords();
+      const existing = await deployedConfig();
       const count = Object.keys(map).length;
-      if (count > 0 && existing && existing.mode === "research") {
+      if (count > 0 && existing.config && existing.config.mode === "research") {
         return send(res, 409, {
-          error: `The configuration is frozen: ${count} research record(s) exist for study version ${existing.studyVersion}. Export and remove them, or deploy the new version with a new data directory.`,
+          error: `The configuration is frozen: ${count} research record(s) exist for study version ${existing.config.studyVersion}. Export and remove them, or deploy the new version with a new data directory.`,
         });
       }
       if (cfg.mode === "research") {
         const problems = activationProblems(cfg);
+        if (cfg.storage.adapter !== "remote-endpoint") {
+          problems.push("A research configuration deployed to this server must use the remote endpoint, or participants' records would never reach it.");
+        } else if (!submitToken) {
+          problems.push("This server has no AGECHECK_SUBMIT_TOKEN set, so it could not accept records.");
+        } else if (!timingSafeEqual(cfg.storage.submitToken || "", submitToken)) {
+          problems.push("The submit token in the configuration does not match this server's AGECHECK_SUBMIT_TOKEN, so every submission would be refused.");
+        }
         if (problems.length) return send(res, 422, { error: "The configuration is not ready for research mode.", problems });
       }
-      // The submit token never needs to be stored here; participants get it
-      // from the served configuration, which this file becomes.
       await writeJsonAtomic(configFile, cfg);
       return send(res, 200, { ok: true, mode: cfg.mode, studyVersion: cfg.studyVersion });
     }
@@ -307,6 +348,9 @@ export function createApp(options = {}) {
       return await handleStatic(req, res, pathname);
     } catch (err) {
       if (err && err.message === "too large") return send(res, 413, { error: "The submission is too large." });
+      if (err && err.message === "records unreadable") {
+        return send(res, 500, { error: "The server's record file could not be read, so nothing was changed. The researcher needs to check it." });
+      }
       return send(res, 500, { error: "The server could not process the request." });
     }
   };

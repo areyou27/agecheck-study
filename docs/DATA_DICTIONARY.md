@@ -50,8 +50,8 @@ A participant who never reached the ID prompt has `id_decision = not_reached`. T
 | `id_decision` | enum | `continue`, `stop` | `not_reached`, `withheld` |  | Choice at the ID prompt. continue = I would continue with ID verification. stop = I would stop here. not_reached = never saw the prompt. Never code a participant who did not reach the prompt as having declined ID verification. |
 | `final_pathway` | enum | `declined_before_check`, `stopped_at_id_request`, `would_continue_with_id`, `incomplete_session`, `withdrawn` |  |  | Summary of the verification choices. withdrawn takes precedence over everything else. incomplete_session = the session ended before an initial decision, or after starting the check but before an ID decision. |
 | `withdrawn_at_step` | enum | `intro`, `eligibility`, `consent`, `scenario`, `verification`, `simulation`, `result`, `confirmation`, `questionnaire`, `debrief`, `finished` | `not_applicable` |  | The step the participant was on when they chose Withdraw from study. not_applicable if they did not withdraw. |
-| `submission_status` | enum | `in_progress`, `submitted`, `withdrawn` |  |  | in_progress = record created at assent and not yet submitted. submitted = questionnaire submitted. withdrawn = participant withdrew. |
-| `questionnaire_status` | enum | `submitted`, `missing` |  |  | submitted = the questionnaire was submitted (individual items may still be skipped). missing = never submitted. |
+| `submission_status` | enum | `in_progress`, `submitted`, `withdrawn` |  |  | in_progress = record created at assent and not yet submitted. submitted = questionnaire submitted. withdrawn = participant withdrew. A withdrawal replaces any earlier state of the record and nothing replaces a withdrawal. |
+| `questionnaire_status` | enum | `submitted`, `missing` |  |  | submitted = the questionnaire was submitted (individual items may still be skipped). missing = never submitted, or withheld after a withdrawal. |
 | `q_risk_exposure` | enum | `1`, `2`, `3`, `4`, `5` | `skipped`, `missing`, `withheld` | perceived_privacy_risk | Agreement (1 strongly disagree to 5 strongly agree): I would be concerned that information requested during this process could be exposed in a security incident. |
 | `q_risk_misuse` | enum | `1`, `2`, `3`, `4`, `5` | `skipped`, `missing`, `withheld` | perceived_privacy_risk | Agreement: I would be concerned that information requested during this process could be used for purposes I did not expect. |
 | `q_risk_feel` | enum | `1`, `2`, `3`, `4`, `5` | `skipped`, `missing`, `withheld` | perceived_privacy_risk | Agreement: Providing the information requested during this process would feel risky to me. |
@@ -64,7 +64,7 @@ A participant who never reached the ID prompt has `id_decision = not_reached`. T
 | `q_id_availability` | enum | `yes`, `no`, `not_sure`, `prefer_not` | `skipped`, `missing`, `withheld` |  | Would you have access to an acceptable government-issued ID if a real platform requested one? The document type is never asked. |
 | `q_breach_awareness` | enum | `yes`, `no`, `not_sure`, `prefer_not` | `skipped`, `missing`, `withheld` |  | Before this study, had you heard about a security incident involving identity documents submitted for online age-related checks? |
 | `q_open_influence` | text (max 1000) |  | `skipped`, `missing`, `withheld` |  | Free text: What most influenced your decision to continue or stop? Review for accidental personal details before sharing exports. |
-| `q_stop_reasons` | multi | `privacy_security`, `no_id_available`, `too_much_effort`, `unexpected_request`, `feature_not_important`, `other`, `prefer_not` | `skipped`, `missing`, `not_applicable`, `withheld` |  | Reasons selected by participants who declined or stopped, separated by semicolons. not_applicable for participants who would continue or who made no decision. |
+| `q_stop_reasons` | multi | `privacy_security`, `no_id_available`, `too_much_effort`, `unexpected_request`, `feature_not_important`, `other`, `prefer_not` | `skipped`, `missing`, `not_applicable`, `withheld` |  | Reasons selected by participants who declined or stopped, separated by semicolons. not_applicable for participants who would continue or who made no decision. Always withheld on a withdrawn record whose responses are not retained, so it cannot hint at the decision. |
 | `q_demo_gender` | enum | `woman`, `man`, `nonbinary`, `self_describe`, `prefer_not` | `skipped`, `missing`, `disabled`, `withheld` |  | Optional gender item. disabled unless demographics are enabled in the approved configuration. |
 | `q_demo_race` | enum | `asian`, `black`, `hispanic`, `middle_eastern`, `native`, `pacific`, `white`, `multiple`, `self_describe`, `prefer_not` | `skipped`, `missing`, `disabled`, `withheld` |  | Optional race or ethnicity item. disabled unless demographics are enabled in the approved configuration. |
 | `ms_consent_to_assent` | integer |  | `not_reached`, `withheld` |  | Milliseconds from the study-information screen appearing to the participant giving assent. |
@@ -73,6 +73,24 @@ A participant who never reached the ID prompt has `id_decision = not_reached`. T
 | `ms_result_to_id_decision` | integer |  | `not_reached`, `withheld` |  | Milliseconds from the uncertain-result and ID-prompt screen appearing to the continue or stop choice. A decision time, not a completion time. |
 | `ms_questionnaire_duration` | integer |  | `not_reached`, `withheld` |  | Milliseconds from the questionnaire appearing to submission. |
 | `recruitment_code` | string (max 16) |  | `not_collected`, `skipped`, `withheld` |  | Recruitment code, only if enabled and approved. Must not contain names or student IDs. not_collected when the field is off. |
+
+## How a stored record is updated
+
+There is one record per response, in the browser's stores and on the reference server alike. The same rule (`resolveSave` in `src/data-dictionary.js`) decides what is kept when a record arrives for a response that is already stored.
+
+| Rank | State of the record |
+|---|---|
+| 0 | Assigned at assent |
+| 1 | Assigned verification screen displayed |
+| 2 | Initial decision made |
+| 3 | Uncertain result and ID prompt reached |
+| 4 | ID decision made |
+| 5 | Questionnaire submitted |
+| 6 | Withdrawn |
+
+A record of higher rank replaces one of lower rank. A record of lower rank that arrives late is ignored, so a slow or repeated save never undoes newer progress and never creates a second record. A withdrawal therefore replaces everything, including a submitted record, and nothing replaces a withdrawal.
+
+When the withdrawal policy is to withhold responses, every store applies it to a withdrawn record before keeping it: decisions, questionnaire answers, timings, and any recruitment code become `withheld`, `q_stop_reasons` included, and `questionnaire_status` becomes `missing`. What remains is the fact of withdrawal, the condition, and the step reached. Draft answers that were never submitted are never part of any record.
 
 ## Measures
 

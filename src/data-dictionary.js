@@ -147,13 +147,13 @@ export const FIELDS = [
     name: "submission_status",
     type: "enum",
     values: ["in_progress", "submitted", "withdrawn"],
-    description: "in_progress = record created at assent and not yet submitted. submitted = questionnaire submitted. withdrawn = participant withdrew.",
+    description: "in_progress = record created at assent and not yet submitted. submitted = questionnaire submitted. withdrawn = participant withdrew. A withdrawal replaces any earlier state of the record and nothing replaces a withdrawal.",
   },
   {
     name: "questionnaire_status",
     type: "enum",
     values: ["submitted", "missing"],
-    description: "submitted = the questionnaire was submitted (individual items may still be skipped). missing = never submitted.",
+    description: "submitted = the questionnaire was submitted (individual items may still be skipped). missing = never submitted, or withheld after a withdrawal.",
   },
   {
     name: "q_risk_exposure",
@@ -260,7 +260,7 @@ export const FIELDS = [
       "prefer_not",
     ],
     special: [SPECIAL.SKIPPED, SPECIAL.MISSING, SPECIAL.NOT_APPLICABLE, SPECIAL.WITHHELD],
-    description: "Reasons selected by participants who declined or stopped, separated by semicolons. not_applicable for participants who would continue or who made no decision.",
+    description: "Reasons selected by participants who declined or stopped, separated by semicolons. not_applicable for participants who would continue or who made no decision. Always withheld on a withdrawn record whose responses are not retained, so it cannot hint at the decision.",
   },
   {
     name: "q_demo_gender",
@@ -384,4 +384,83 @@ export function validateRecord(record) {
     problems.push("response_code has the wrong shape");
   }
   return problems;
+}
+
+// ---------------------------------------------------------------------------
+// Rules shared by every place a record is stored (the browser's stores and the
+// reference server), so they cannot disagree.
+
+/**
+ * Applies the "do not retain partial responses" withdrawal policy to a record:
+ * decisions, questionnaire answers, timings, and any recruitment code become
+ * "withheld". What remains is the fact of withdrawal, the condition, and the
+ * step reached. Codes that only describe the study's structure (not_reached,
+ * disabled, not_collected) are left alone.
+ */
+export function withholdResponses(record) {
+  const out = { ...record };
+  const keep = [SPECIAL.NOT_REACHED, SPECIAL.DISABLED, SPECIAL.NOT_COLLECTED];
+  out.initial_decision = SPECIAL.WITHHELD;
+  out.id_decision = SPECIAL.WITHHELD;
+  for (const f of FIELDS) {
+    if (f.name.startsWith("q_")) {
+      if (f.name === "q_stop_reasons") out[f.name] = SPECIAL.WITHHELD;
+      else if (!keep.includes(out[f.name])) out[f.name] = SPECIAL.WITHHELD;
+    } else if (f.name.startsWith("ms_")) {
+      out[f.name] = SPECIAL.WITHHELD;
+    }
+  }
+  if (out.recruitment_code !== SPECIAL.NOT_COLLECTED) out.recruitment_code = SPECIAL.WITHHELD;
+  out.questionnaire_status = "missing";
+  return out;
+}
+
+/**
+ * How far a record has progressed. A higher rank always wins over a lower one,
+ * so a save that arrives late can never undo newer progress, and a withdrawal
+ * can never be undone by anything.
+ *   0 assigned · 1 assigned screen displayed · 2 initial decision made ·
+ *   3 ID prompt reached · 4 ID decision made · 5 submitted · 6 withdrawn
+ */
+export function recordRank(record) {
+  if (!record) return -1;
+  if (record.submission_status === "withdrawn") return 6;
+  if (record.submission_status === "submitted") return 5;
+  let rank = 0;
+  if (record.assigned_screen_displayed === "yes") rank = 1;
+  if (record.initial_decision === "start" || record.initial_decision === "decline") rank = 2;
+  if (record.reached_id_prompt === "yes") rank = 3;
+  if (record.id_decision === "continue" || record.id_decision === "stop") rank = 4;
+  return rank;
+}
+
+function sameRecord(a, b) {
+  return FIELD_NAMES.every((n) => a[n] === b[n]);
+}
+
+/**
+ * Decides what a store keeps when a record arrives for a response it may
+ * already hold. Returns { record, outcome }:
+ *   created     nothing was stored before; keep the incoming record
+ *   updated     the incoming record is newer; keep it
+ *   unchanged   the incoming record is the same as, or no newer than, the stored one
+ *   superseded  the incoming record is older than the stored one; ignore it
+ * `record` is what should be stored afterwards (the existing one when nothing changes).
+ *
+ * options.retainWithdrawn: false applies the withholding policy to any
+ * withdrawn record before it is stored; true or undefined stores it as sent.
+ */
+export function resolveSave(existing, incoming, options = {}) {
+  let next = incoming;
+  if (next.submission_status === "withdrawn" && options.retainWithdrawn === false) next = withholdResponses(next);
+  if (!existing) return { record: next, outcome: "created" };
+  const have = recordRank(existing);
+  const got = recordRank(next);
+  if (got < have) return { record: existing, outcome: "superseded" };
+  if (got === have) {
+    if (sameRecord(existing, next)) return { record: existing, outcome: "unchanged" };
+    if (have === 6) return { record: existing, outcome: "unchanged" };       // a withdrawal is final
+    return { record: next, outcome: "updated" };                             // same milestone, newer content
+  }
+  return { record: next, outcome: "updated" };
 }
