@@ -57,8 +57,10 @@ PORT=<whatever the host expects>
 
 Serve it over HTTPS. Then there are two layouts:
 
+The server accepts no record until a valid research configuration has been deployed to it. It refuses a research configuration whose required study information is empty or a placeholder, whose withdrawal policy is not chosen, whose storage is not the remote endpoint, or whose submit token differs from the server's `AGECHECK_SUBMIT_TOKEN`. "Push to server" in the dashboard lists whatever it refused.
+
 **One origin (simplest).** The server hosts everything. Participants open `https://your-host/`, the dashboard is `https://your-host/researcher.html`, and no CORS setup is needed. In the dashboard set the endpoint URL to `https://your-host`, paste the submit token, activate, and use **Push to server** with the admin token. The server then serves the frozen configuration as `study.config.json` and refuses further changes once records exist.
 
-**Split (app on Pages, server elsewhere).** Also set `AGECHECK_ALLOWED_ORIGIN=https://<owner>.github.io` on the server (the origin only, no path). In the dashboard set the endpoint URL to the server's `https://` address, activate, download `study.config.json`, and commit it to the repository root so the Pages site loads it. Push the same configuration to the server as well so it enforces the study version on every submission.
+**Split (app on Pages, server elsewhere).** Also set `AGECHECK_ALLOWED_ORIGIN=https://<owner>.github.io` on the server (the origin only, no path). In the dashboard set the endpoint URL to the server's `https://` address, activate, download `study.config.json`, and commit it to the repository root so the Pages site loads it. Push the same configuration to the server as well: this is required, because the server accepts nothing without it, and it is how the server enforces the study version and the withdrawal policy on every submission.
 
 Either way, open the participant link on a device that is not yours, confirm the header shows "Research mode", check that the record appears under research data in the dashboard, then delete it by its response code before the first real participant.

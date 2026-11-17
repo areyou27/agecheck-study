@@ -9,6 +9,8 @@
 // Text in [SQUARE BRACKETS] is a placeholder. Research mode cannot be
 // activated while any placeholder remains.
 
+import { FIELDS } from "./data-dictionary.js";
+
 export const CONFIG_SCHEMA_VERSION = 1;
 
 export const DEFAULT_STUDY_CONFIG = {
@@ -269,9 +271,12 @@ export const DEFAULT_STUDY_CONFIG = {
       "Withdrawing ends your participation now. It is different from declining the fictional platform's verification. Your answers so far will be handled as described in the study information.",
     confirmLabel: "Yes, withdraw",
     cancelLabel: "No, go back",
-    // false: only the fact of withdrawal, the condition, and the step reached
-    // are kept. true: partial responses are kept with status "withdrawn".
-    retainPartialResponses: false,
+    // The researcher's retention policy for a mid-session withdrawal:
+    //   false  only the fact of withdrawal, the condition, and the step reached are kept
+    //   true   partial responses are kept, marked withdrawn
+    //   null   not chosen yet. Research mode cannot be activated until it is.
+    //          Preview mode behaves as false, the more protective choice.
+    retainPartialResponses: null,
     withdrawnMessage:
       "You have withdrawn from the study. Thank you for your time. You may close this window.",
   },
@@ -294,16 +299,50 @@ export const DEFAULT_STUDY_CONFIG = {
 
 export const PLACEHOLDER_PATTERN = /\[[A-Z][A-Z0-9 ,.:;'()/-]*\]/g;
 
+/**
+ * Study information only the researcher can supply. Each entry must be filled
+ * in, with no placeholder left, before research mode can be activated. The app
+ * never supplies contacts, approvals, or a retention policy on its own.
+ */
+export const REQUIRED_STUDY_INFORMATION = [
+  ["consent.researcherContact", "Researcher contact"],
+  ["consent.supervisorContact", "Supervisor or teacher contact"],
+  ["consent.participationRequirements", "Approved participation requirements"],
+  ["consent.dataCollected", "What the research app records"],
+  ["consent.storageAndAccess", "Data storage, access, and retention"],
+  ["consent.withdrawal", "Withdrawal procedure"],
+  ["consent.duration", "Expected duration"],
+  ["consent.parentalPermissionNote", "Parental permission note"],
+  ["consent.assentStatement", "Assent statement"],
+  ["eligibility.recruitmentCriteriaText", "Recruitment criteria statement"],
+];
+
+function get(config, path) {
+  let v = config;
+  for (const key of path.split(".")) {
+    if (v === null || typeof v !== "object") return undefined;
+    v = v[key];
+  }
+  return v;
+}
+
+function isText(v) {
+  return typeof v === "string" && v.trim().length > 0;
+}
+
 /** Return every placeholder still present in researcher-editable text. */
 export function findPlaceholders(config) {
   const found = [];
-  const c = config.consent || {};
-  for (const key of Object.keys(c)) {
-    const value = c[key];
-    if (typeof value !== "string") continue;
+  const seen = new Set();
+  const check = (field, value) => {
+    if (typeof value !== "string" || seen.has(field)) return;
+    seen.add(field);
     const matches = value.match(PLACEHOLDER_PATTERN);
-    if (matches) found.push({ field: `consent.${key}`, placeholders: matches });
-  }
+    if (matches) found.push({ field, placeholders: matches });
+  };
+  const c = (config && config.consent) || {};
+  for (const key of Object.keys(c)) check(`consent.${key}`, c[key]);
+  for (const [path] of REQUIRED_STUDY_INFORMATION) check(path, get(config, path));
   return found;
 }
 
@@ -327,7 +366,7 @@ export function cloneConfig(config) {
 /** Merge a stored (possibly partial) config over the defaults. */
 export function mergeConfig(stored) {
   const base = cloneConfig(DEFAULT_STUDY_CONFIG);
-  if (!stored || typeof stored !== "object") return base;
+  if (!stored || typeof stored !== "object" || Array.isArray(stored)) return base;
   return deepMerge(base, stored);
 }
 
@@ -346,48 +385,225 @@ function deepMerge(target, source) {
   return target;
 }
 
+/** true only when the researcher chose to keep partial responses after a withdrawal. */
+export function retainsPartialResponses(config) {
+  return Boolean(config && config.withdrawal && config.withdrawal.retainPartialResponses === true);
+}
+
+// ---------------------------------------------------------------------------
+// Validation. Used wherever a configuration enters the app: the dashboard
+// (saving, importing, activating), the participant app (a served
+// study.config.json or the browser's saved copy), and the reference server.
+
+const TEXT_FIELDS = [
+  "appName", "platformName",
+  "eligibility.ineligibleMessage",
+  "intro.heading", "intro.body", "intro.continueLabel",
+  "consent.heading", "consent.agreeLabel", "consent.declineLabel", "consent.declinedMessage",
+  "scenario.heading", "scenario.body", "scenario.continueLabel",
+  "verification.heading", "verification.body", "verification.advanceNoticeSentence",
+  "verification.startLabel", "verification.declineLabel", "verification.declinedMessage",
+  "simulation.label", "simulation.status",
+  "result.line1", "result.line2", "result.line3", "result.continueLabel", "result.stopLabel",
+  "result.continueConfirmation", "result.stopConfirmation", "result.nextLabel",
+  "questionnaire.heading", "questionnaire.instruction", "questionnaire.submitLabel",
+  "debrief.heading", "debrief.body", "debrief.scope", "debrief.responseCodeIntro",
+  "debrief.finishLabel", "debrief.finishedMessage",
+  "withdrawal.linkLabel", "withdrawal.heading", "withdrawal.body", "withdrawal.confirmLabel",
+  "withdrawal.cancelLabel", "withdrawal.withdrawnMessage",
+];
+
+const STRING_FIELDS = [
+  ...REQUIRED_STUDY_INFORMATION.map(([path]) => path),
+  "storage.endpointUrl", "storage.submitToken",
+  "eligibility.recruitmentCode.label", "eligibility.recruitmentCode.help", "eligibility.recruitmentCode.pattern",
+];
+
+const LIKERT_IDS = ["risk_exposure", "risk_misuse", "risk_feel", "transp_explained", "transp_expect", "id_unexpected", "id_understood"];
+const ID_PROMPT_ONLY = ["id_unexpected", "id_understood"];
+const CHOICE_BLOCKS = [
+  ["recall", "recall_notice"],
+  ["priorExperience", "prior_experience"],
+  ["idAvailability", "id_availability"],
+  ["breachAwareness", "breach_awareness"],
+];
+const DEMOGRAPHIC_IDS = ["demo_gender", "demo_race"];
+const STORAGE_ADAPTERS = ["none", "local-device", "remote-endpoint"];
+
+function dictionaryValues(itemId) {
+  const field = FIELDS.find((f) => f.name === `q_${itemId}`);
+  return field ? field.values : [];
+}
+
+function sameSet(a, b) {
+  return a.length === b.length && new Set(a).size === a.length && a.every((v) => b.includes(v));
+}
+
+function checkOptions(problems, where, options, allowed, { exact }) {
+  if (!Array.isArray(options) || options.length === 0) {
+    problems.push(`${where} must list its answer choices.`);
+    return;
+  }
+  const values = options.map((o) => (o && typeof o === "object" ? String(o.value) : ""));
+  if (options.some((o) => !o || typeof o !== "object" || !isText(o.label))) problems.push(`${where}: every answer choice needs a label.`);
+  const ok = exact ? sameSet(values, allowed) : new Set(values).size === values.length && values.every((v) => allowed.includes(v));
+  if (!ok) problems.push(`${where}: the answer choices must be ${exact ? "exactly" : "among"} ${allowed.join(", ")} (the values in the data dictionary).`);
+}
+
 /**
- * Checks that must pass before research mode may be activated. Returns a
- * list of problems; an empty list means activation is allowed.
+ * Structural check: the shape, types, and fixed codes the app, the data
+ * dictionary, and the server rely on. Returns a list of problems; an empty
+ * list means the configuration can be loaded. It does not judge whether the
+ * study information has been written yet (activationProblems does that).
+ */
+export function validateConfig(config) {
+  const problems = [];
+  if (!config || typeof config !== "object" || Array.isArray(config)) return ["The configuration is not an object."];
+
+  if (config.schemaVersion !== CONFIG_SCHEMA_VERSION) problems.push(`schemaVersion must be ${CONFIG_SCHEMA_VERSION}.`);
+  if (config.mode !== "preview" && config.mode !== "research") problems.push('mode must be "preview" or "research".');
+  if (typeof config.frozen !== "boolean") problems.push("frozen must be true or false.");
+  if (!(config.activatedOn === null || /^\d{4}-\d{2}-\d{2}$/.test(String(config.activatedOn)))) problems.push("activatedOn must be empty or a date (YYYY-MM-DD).");
+  if (typeof config.studyVersion !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(config.studyVersion)) {
+    problems.push("Study version must be 1 to 40 letters, digits, dots, dashes, or underscores, starting with a letter or digit.");
+  }
+
+  for (const path of TEXT_FIELDS) if (!isText(get(config, path))) problems.push(`${path} must be non-empty text.`);
+  for (const path of STRING_FIELDS) if (typeof get(config, path) !== "string") problems.push(`${path} must be text.`);
+
+  const e = config.eligibility || {};
+  if (!Number.isInteger(e.minAge) || !Number.isInteger(e.maxAge) || e.minAge > e.maxAge || e.minAge < 13 || e.maxAge > 25) {
+    problems.push("Approved age range must be whole numbers between 13 and 25 with the minimum no greater than the maximum.");
+  }
+  const rc = e.recruitmentCode || {};
+  if (typeof rc.enabled !== "boolean") problems.push("eligibility.recruitmentCode.enabled must be true or false.");
+  if (typeof rc.pattern === "string") {
+    try {
+      new RegExp(rc.pattern);
+    } catch {
+      problems.push("eligibility.recruitmentCode.pattern is not a valid pattern.");
+    }
+  }
+
+  const sim = config.simulation || {};
+  if (!Number.isInteger(sim.durationMs) || sim.durationMs < 2500 || sim.durationMs > 3500) {
+    problems.push("simulation.durationMs must stay close to three seconds (2500 to 3500).");
+  }
+
+  const q = config.questionnaire || {};
+  const scale = Array.isArray(q.scale) ? q.scale : [];
+  if (scale.length !== 5 || scale.some((s, i) => !s || s.value !== i + 1 || !isText(s.label))) {
+    problems.push("questionnaire.scale must be the five agreement points 1 to 5, each with a label.");
+  }
+  const items = Array.isArray(q.items) ? q.items : [];
+  const itemIds = items.map((it) => (it && typeof it === "object" ? it.id : undefined));
+  if (!sameSet(itemIds, LIKERT_IDS)) problems.push(`questionnaire.items must be exactly these items, once each: ${LIKERT_IDS.join(", ")}.`);
+  for (const it of items) {
+    if (!it || typeof it !== "object") continue;
+    if (!isText(it.text)) problems.push(`questionnaire item ${it.id}: the wording is missing.`);
+    const idOnly = ID_PROMPT_ONLY.includes(it.id);
+    if (Boolean(it.onlyIfReachedIdPrompt) !== idOnly) problems.push(`questionnaire item ${it.id}: onlyIfReachedIdPrompt must be ${idOnly}.`);
+  }
+  for (const [key, id] of CHOICE_BLOCKS) {
+    const block = q[key];
+    if (!block || typeof block !== "object" || block.id !== id || !isText(block.text)) {
+      problems.push(`questionnaire.${key} must have id "${id}" and its wording.`);
+      continue;
+    }
+    checkOptions(problems, `questionnaire.${key}`, block.options, dictionaryValues(id), { exact: true });
+  }
+  const open = q.openEnded;
+  if (!open || open.id !== "open_influence" || !isText(open.text) || !Number.isInteger(open.maxLength) || open.maxLength < 1 || open.maxLength > 1000) {
+    problems.push('questionnaire.openEnded must have id "open_influence", its wording, and a maxLength from 1 to 1000.');
+  }
+  const stop = q.stopReasons;
+  if (!stop || stop.id !== "stop_reasons" || !isText(stop.text)) problems.push('questionnaire.stopReasons must have id "stop_reasons" and its wording.');
+  else checkOptions(problems, "questionnaire.stopReasons", stop.options, dictionaryValues("stop_reasons"), { exact: true });
+
+  const d = config.demographics || {};
+  if (typeof d.enabled !== "boolean") problems.push("demographics.enabled must be true or false.");
+  const dItems = Array.isArray(d.items) ? d.items : null;
+  if (!dItems) problems.push("demographics.items must be a list.");
+  else {
+    const ids = dItems.map((it) => (it && typeof it === "object" ? it.id : undefined));
+    if (new Set(ids).size !== ids.length || ids.some((id) => !DEMOGRAPHIC_IDS.includes(id))) {
+      problems.push(`demographics.items may only contain ${DEMOGRAPHIC_IDS.join(" and ")}, once each.`);
+    }
+    for (const it of dItems) {
+      if (!it || typeof it !== "object" || !DEMOGRAPHIC_IDS.includes(it.id)) continue;
+      if (!isText(it.text)) problems.push(`demographics item ${it.id}: the wording is missing.`);
+      checkOptions(problems, `demographics item ${it.id}`, it.options, dictionaryValues(it.id), { exact: false });
+    }
+  }
+
+  const w = config.withdrawal || {};
+  if (!(w.retainPartialResponses === null || typeof w.retainPartialResponses === "boolean")) {
+    problems.push("withdrawal.retainPartialResponses must be true, false, or not yet chosen.");
+  }
+
+  const s = config.storage || {};
+  if (!STORAGE_ADAPTERS.includes(s.adapter)) problems.push(`storage.adapter must be one of ${STORAGE_ADAPTERS.join(", ")}.`);
+
+  const p = config.preview || {};
+  if (typeof p.allowForcedCondition !== "boolean") problems.push("preview.allowForcedCondition must be true or false.");
+
+  return problems;
+}
+
+/**
+ * Everything that must be true before research mode may be activated, or
+ * before a research-mode configuration may be used anywhere. Returns a list
+ * of problems; an empty list means collection may run.
  */
 export function activationProblems(config) {
-  const problems = [];
-  for (const p of findPlaceholders(config)) {
-    problems.push(`Placeholder text remains in ${p.field}: ${p.placeholders.join(", ")}`);
+  const problems = validateConfig(config);
+  if (!config || typeof config !== "object") return problems;
+
+  const placeholders = new Map(findPlaceholders(config).map((p) => [p.field, p.placeholders]));
+  for (const [path, label] of REQUIRED_STUDY_INFORMATION) {
+    const value = get(config, path);
+    if (!isText(value)) problems.push(`${label} is required and is empty (${path}).`);
+    else if (placeholders.has(path)) problems.push(`${label} still contains placeholder text: ${placeholders.get(path).join(", ")} (${path}).`);
+    placeholders.delete(path);
   }
-  const e = config.eligibility || {};
-  if (
-    !Number.isInteger(e.minAge) ||
-    !Number.isInteger(e.maxAge) ||
-    e.minAge > e.maxAge ||
-    e.minAge < 13 ||
-    e.maxAge > 25
-  ) {
-    problems.push(
-      "Approved age range must be whole numbers between 13 and 25 with the minimum no greater than the maximum."
-    );
-  }
-  if (!e.recruitmentCriteriaText || !e.recruitmentCriteriaText.trim()) {
-    problems.push("Recruitment criteria text is empty.");
-  }
+  for (const [field, found] of placeholders) problems.push(`Placeholder text remains in ${field}: ${found.join(", ")}`);
+
   const s = config.storage || {};
   if (s.adapter === "none" || !s.adapter) {
     problems.push("A storage configuration is required (local-device or remote-endpoint).");
   } else if (s.adapter === "remote-endpoint") {
-    if (!/^https?:\/\//.test(s.endpointUrl || "")) {
-      problems.push("Remote endpoint URL must start with http:// or https://.");
-    }
-    if (!s.submitToken || s.submitToken.length < 16) {
-      problems.push("Remote endpoint submit token must be at least 16 characters.");
-    }
-  } else if (s.adapter !== "local-device") {
-    problems.push(`Unknown storage adapter: ${s.adapter}`);
+    if (!/^https?:\/\/[^\s/]+/.test(s.endpointUrl || "")) problems.push("Remote endpoint URL must start with http:// or https://.");
+    if (!s.submitToken || s.submitToken.length < 16) problems.push("Remote endpoint submit token must be at least 16 characters.");
   }
-  if (!config.studyVersion || /draft/i.test(config.studyVersion)) {
+
+  if (typeof config.studyVersion === "string" && /draft/i.test(config.studyVersion)) {
     problems.push('Study version must be set to a non-draft value (for example "1.0.0").');
   }
-  if (!config.withdrawal || typeof config.withdrawal.retainPartialResponses !== "boolean") {
-    problems.push("Withdrawal policy (retain partial responses: yes or no) must be set.");
+  const w = config.withdrawal || {};
+  if (typeof w.retainPartialResponses !== "boolean") {
+    problems.push("Withdrawal policy must be chosen: keep partial responses after a withdrawal, or withhold them.");
   }
   return problems;
+}
+
+/** The checks that apply to a configuration in its own mode. */
+export function configProblems(config) {
+  return config && config.mode === "research" ? activationProblems(config) : validateConfig(config);
+}
+
+/**
+ * Reads a configuration that came from outside (an import, a served
+ * study.config.json, the browser's saved copy, a server upload). Returns
+ * { config, problems }. The configuration must not be used while problems
+ * is not empty.
+ */
+export function parseConfig(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return { config: null, problems: ["The configuration is not an object."] };
+  }
+  if (input.schemaVersion !== CONFIG_SCHEMA_VERSION) {
+    return { config: null, problems: [`This is not a study configuration for schema version ${CONFIG_SCHEMA_VERSION}.`] };
+  }
+  const config = mergeConfig(input);
+  return { config, problems: configProblems(config) };
 }

@@ -5,7 +5,8 @@
 // transition records a relative time mark (milliseconds since the session
 // began) so the record never needs an absolute timestamp.
 
-import { SPECIAL, FIELDS } from "./data-dictionary.js";
+import { SPECIAL, FIELDS, withholdResponses } from "./data-dictionary.js";
+import { retainsPartialResponses } from "./study-config.js";
 
 export const CONDITION = {
   ADVANCE: "advance_notice",
@@ -59,12 +60,16 @@ export function assignCondition(random = defaultRandom) {
 }
 
 /**
- * A new session. Nothing is stored until assent; the record is created at
+ * A new session, bound to the mode and study version of the configuration it
+ * starts under. Nothing is stored until assent; the record is created at
  * assent so ineligible or non-consenting visitors leave nothing behind.
  */
-export function createSession({ now = Date.now } = {}) {
+export function createSession(config, { now = Date.now } = {}) {
+  if (!config || typeof config !== "object") throw new Error("createSession needs the study configuration");
   return {
-    schema: 1,
+    schema: 2,
+    mode: config.mode === "research" ? "research" : "preview",
+    configVersion: config.studyVersion,
     responseId: null,
     responseCode: null,
     studyVersion: null,
@@ -81,9 +86,27 @@ export function createSession({ now = Date.now } = {}) {
     reachedResult: false,
     idDecision: null,
     withdrawnAtStep: null,
+    withdrawalSync: null,
+    withdrawalError: null,
     questionnaire: null,
     submission: { status: "not_started", error: null, attempts: 0 },
   };
+}
+
+/**
+ * A session only continues under the mode and study version it began with.
+ * A preview session can therefore never turn into a research record, and a
+ * session never straddles two versions of the study.
+ */
+export function sessionMatchesConfig(session, config) {
+  const mode = config.mode === "research" ? "research" : "preview";
+  return Boolean(session) && session.mode === mode && session.configVersion === config.studyVersion;
+}
+
+function requireMatch(session, config) {
+  if (!sessionMatchesConfig(session, config)) {
+    throw new Error("This session belongs to a different mode or study version and cannot continue.");
+  }
 }
 
 function mark(session, name, now) {
@@ -153,14 +176,15 @@ export function declineAssent(session) {
  */
 export function giveAssent(session, config, { now = Date.now, random = defaultRandom, forcedCondition = null } = {}) {
   expect(session, "consent");
+  requireMatch(session, config);
   session.assentGiven = true;
   mark(session, "assent", now);
   session.responseId = uuidv4();
   session.responseCode = responseCodeFor(session.responseId);
   session.studyVersion = config.studyVersion;
-  session.recordKind = config.mode === "research" ? "research" : "preview_walkthrough";
+  session.recordKind = session.mode === "research" ? "research" : "preview_walkthrough";
   const forcingAllowed =
-    config.mode !== "research" && config.preview && config.preview.allowForcedCondition === true;
+    session.mode !== "research" && config.preview && config.preview.allowForcedCondition === true;
   if (forcingAllowed && (forcedCondition === CONDITION.ADVANCE || forcedCondition === CONDITION.LATER)) {
     session.condition = forcedCondition;
     session.assignmentMethod = "forced_preview";
@@ -180,10 +204,14 @@ export function continueScenario(session, { now = Date.now } = {}) {
   return session;
 }
 
-/** Called by the UI once the verification card for the condition is in the DOM. */
+/**
+ * Called by the UI once the verification card for the condition is in the
+ * DOM. Returns true the first time, so the caller knows to save the milestone.
+ */
 export function confirmVerificationDisplayed(session) {
-  if (session.step === "verification") session.assignedScreenDisplayed = true;
-  return session;
+  if (session.step !== "verification" || session.assignedScreenDisplayed) return false;
+  session.assignedScreenDisplayed = true;
+  return true;
 }
 
 export function initialDecision(session, choice, { now = Date.now } = {}) {
@@ -242,29 +270,35 @@ export function submitQuestionnaire(session, answers, { now = Date.now } = {}) {
   if (st === "submitting" || st === "submitted") return session;
   expect(session, "questionnaire");
   session.questionnaire = sanitizeAnswers(answers);
-  mark(session, "questionnaire_submit", now);
+  remark(session, "questionnaire_submit", now);
   session.submission = { status: "submitting", error: null, attempts: session.submission.attempts + 1 };
   return session;
 }
 
-export function retrySubmit(session) {
+/** Try again after a failed save, with the answers as they stand now. */
+export function retrySubmit(session, answers, { now = Date.now } = {}) {
   expect(session, "questionnaire");
   if (session.submission.status !== "failed") return session;
+  if (answers !== undefined) {
+    session.questionnaire = sanitizeAnswers(answers);
+    remark(session, "questionnaire_submit", now);
+  }
   session.submission = { status: "submitting", error: null, attempts: session.submission.attempts + 1 };
   return session;
 }
 
+/** Returns true when the session moved to the debrief (false if it had already left, for example by withdrawing). */
 export function markSubmitted(session) {
-  if (session.submission.status !== "submitting") return session;
+  if (session.submission.status !== "submitting") return false;
   session.submission = { status: "submitted", error: null, attempts: session.submission.attempts };
   session.step = "debrief";
-  return session;
+  return true;
 }
 
 export function markSubmitFailed(session, message) {
-  if (session.submission.status !== "submitting") return session;
+  if (session.submission.status !== "submitting") return false;
   session.submission = { status: "failed", error: String(message || "Submission failed"), attempts: session.submission.attempts };
-  return session;
+  return true;
 }
 
 export function finish(session) {
@@ -273,15 +307,46 @@ export function finish(session) {
   return session;
 }
 
-/** Withdrawal is separate from declining verification and can happen at any study step after assent. */
+/**
+ * Withdrawal is separate from declining verification and can happen at any
+ * study step after assent, including while a submission is still being
+ * saved. It ends participation at once. Whether the withdrawal has reached
+ * the study's storage is tracked separately in withdrawalSync:
+ *   pending  not yet confirmed by the storage
+ *   saved    confirmed
+ *   failed   the last attempt failed; the UI offers to try again
+ */
 export function withdraw(session, { now = Date.now } = {}) {
   if (!session.assentGiven) throw new Error("Cannot withdraw before assent");
-  if (session.step === "withdrawn" || session.step === "finished") return session;
+  if (session.step === "withdrawn" || session.step === "finished" || session.step === "debrief") return session;
   session.withdrawnAtStep = session.step;
   mark(session, "withdrawn", now);
   session.submission = { status: "withdrawn", error: null, attempts: session.submission.attempts };
   session.step = "withdrawn";
+  session.withdrawalSync = "pending";
+  session.withdrawalError = null;
   return session;
+}
+
+export function markWithdrawalPending(session) {
+  if (session.step !== "withdrawn") return false;
+  session.withdrawalSync = "pending";
+  session.withdrawalError = null;
+  return true;
+}
+
+export function markWithdrawalSaved(session) {
+  if (session.step !== "withdrawn") return false;
+  session.withdrawalSync = "saved";
+  session.withdrawalError = null;
+  return true;
+}
+
+export function markWithdrawalFailed(session, message) {
+  if (session.step !== "withdrawn") return false;
+  session.withdrawalSync = "failed";
+  session.withdrawalError = String(message || "The withdrawal could not be saved.");
+  return true;
 }
 
 export function canWithdraw(session) {
@@ -335,51 +400,50 @@ function diff(marks, a, b) {
 }
 
 /**
- * Build the record for storage. Structural codes (not_reached, not_applicable,
- * disabled) take precedence over missing, which takes precedence over skipped.
+ * Build the record for storage.
+ *
+ * Structural codes (not_reached, not_applicable, disabled, not_collected)
+ * take precedence over missing, which takes precedence over skipped.
+ *
+ * Questionnaire answers count once the participant pressed Submit: while the
+ * save is in flight, after it succeeded, and on a withdrawal that came after
+ * it. Draft answers that were never submitted are never part of a record.
+ *
+ * A withdrawn record is then passed through the retention policy: unless the
+ * researcher chose to keep partial responses, everything but the fact of
+ * withdrawal, the condition, and the step reached is withheld.
  */
 export function buildRecord(session, config) {
   if (!hasRecord(session)) throw new Error("No record exists before assent");
   const pathway = finalPathway(session);
   const withdrawn = pathway === "withdrawn";
-  const withhold = withdrawn && !(config.withdrawal && config.withdrawal.retainPartialResponses);
-  // A record built while the save is in flight is the submission itself.
-  const submitted = session.submission.status === "submitted" || session.submission.status === "submitting";
-  const q = session.questionnaire || {};
+  const status = session.submission.status;
+  const submitted = status === "submitted" || status === "submitting";
+  const pressedSubmit = session.questionnaire != null && session.marks.questionnaire_submit !== undefined;
+  const answered = pressedSubmit && (submitted || withdrawn);
+  const q = answered ? session.questionnaire : {};
   const reachedId = session.reachedResult === true;
-  const declinedOrStopped = pathway === "declined_before_check" || pathway === "stopped_at_id_request";
+  const declinedOrStopped = session.initialDecision === INITIAL.DECLINE || session.idDecision === ID.STOP;
   const demographicsOn = Boolean(config.demographics && config.demographics.enabled);
 
-  const likert = (id, onlyIfReachedId = false) => {
-    if (onlyIfReachedId && !reachedId) return SPECIAL.NOT_REACHED;
-    if (withhold) return SPECIAL.WITHHELD;
-    if (!submitted) return SPECIAL.MISSING;
+  const answer = (id) => {
+    if (!answered) return SPECIAL.MISSING;
     return q[id] !== undefined ? q[id] : SPECIAL.SKIPPED;
   };
-  const choice = (id, { disabled = false } = {}) => {
-    if (disabled) return SPECIAL.DISABLED;
-    if (withhold) return SPECIAL.WITHHELD;
-    if (!submitted) return SPECIAL.MISSING;
-    return q[id] !== undefined ? q[id] : SPECIAL.SKIPPED;
-  };
-  const guard = (value) => (withhold ? SPECIAL.WITHHELD : value);
+  const likert = (id, onlyIfReachedId = false) => (onlyIfReachedId && !reachedId ? SPECIAL.NOT_REACHED : answer(id));
+  const choice = (id, { disabled = false } = {}) => (disabled ? SPECIAL.DISABLED : answer(id));
 
   let stopReasons;
   if (!declinedOrStopped) stopReasons = SPECIAL.NOT_APPLICABLE;
-  else if (withhold) stopReasons = SPECIAL.WITHHELD;
-  else if (!submitted) stopReasons = SPECIAL.MISSING;
+  else if (!answered) stopReasons = SPECIAL.MISSING;
   else stopReasons = q.stop_reasons && q.stop_reasons.length ? q.stop_reasons.join(";") : SPECIAL.SKIPPED;
 
   let openText;
-  if (withhold) openText = SPECIAL.WITHHELD;
-  else if (!submitted) openText = SPECIAL.MISSING;
+  if (!answered) openText = SPECIAL.MISSING;
   else openText = q.open_influence ? q.open_influence : SPECIAL.SKIPPED;
 
   const rcEnabled = Boolean(config.eligibility.recruitmentCode && config.eligibility.recruitmentCode.enabled);
-  let recruitmentCode;
-  if (!rcEnabled) recruitmentCode = SPECIAL.NOT_COLLECTED;
-  else if (withhold) recruitmentCode = SPECIAL.WITHHELD;
-  else recruitmentCode = session.eligibility.recruitmentCode || SPECIAL.SKIPPED;
+  const recruitmentCode = rcEnabled ? session.eligibility.recruitmentCode || SPECIAL.SKIPPED : SPECIAL.NOT_COLLECTED;
 
   const m = session.marks;
   const record = {
@@ -390,14 +454,14 @@ export function buildRecord(session, config) {
     condition: session.condition,
     assignment_method: session.assignmentMethod,
     assigned_screen_displayed: session.assignedScreenDisplayed ? "yes" : "no",
-    initial_decision: guard(session.initialDecision || SPECIAL.NOT_REACHED),
+    initial_decision: session.initialDecision || SPECIAL.NOT_REACHED,
     reached_uncertain_result: reachedId ? "yes" : "no",
     reached_id_prompt: reachedId ? "yes" : "no",
-    id_decision: guard(session.idDecision || SPECIAL.NOT_REACHED),
+    id_decision: session.idDecision || SPECIAL.NOT_REACHED,
     final_pathway: pathway,
-    withdrawn_at_step: withdrawn ? session.withdrawnAtStep || "unknown" : SPECIAL.NOT_APPLICABLE,
+    withdrawn_at_step: withdrawn ? session.withdrawnAtStep || "intro" : SPECIAL.NOT_APPLICABLE,
     submission_status: withdrawn ? "withdrawn" : submitted ? "submitted" : "in_progress",
-    questionnaire_status: submitted && !withhold ? "submitted" : "missing",
+    questionnaire_status: answered ? "submitted" : "missing",
     q_risk_exposure: likert("risk_exposure"),
     q_risk_misuse: likert("risk_misuse"),
     q_risk_feel: likert("risk_feel"),
@@ -413,17 +477,17 @@ export function buildRecord(session, config) {
     q_stop_reasons: stopReasons,
     q_demo_gender: choice("demo_gender", { disabled: !demographicsOn }),
     q_demo_race: choice("demo_race", { disabled: !demographicsOn }),
-    ms_consent_to_assent: guard(diff(m, "consent_shown", "assent")),
-    ms_verification_to_initial_decision: guard(diff(m, "verification_shown", "initial_decision")),
-    ms_simulation_duration: guard(diff(m, "simulation_start", "simulation_end")),
-    ms_result_to_id_decision: guard(diff(m, "result_shown", "id_decision")),
-    ms_questionnaire_duration: guard(submitted ? diff(m, "questionnaire_shown", "questionnaire_submit") : SPECIAL.NOT_REACHED),
+    ms_consent_to_assent: diff(m, "consent_shown", "assent"),
+    ms_verification_to_initial_decision: diff(m, "verification_shown", "initial_decision"),
+    ms_simulation_duration: diff(m, "simulation_start", "simulation_end"),
+    ms_result_to_id_decision: diff(m, "result_shown", "id_decision"),
+    ms_questionnaire_duration: answered ? diff(m, "questionnaire_shown", "questionnaire_submit") : SPECIAL.NOT_REACHED,
     recruitment_code: recruitmentCode,
   };
   // Keep dictionary order.
   const ordered = {};
   for (const f of FIELDS) ordered[f.name] = record[f.name];
-  return ordered;
+  return withdrawn && !retainsPartialResponses(config) ? withholdResponses(ordered) : ordered;
 }
 
 // ---------------------------------------------------------------------------
@@ -433,11 +497,16 @@ export function serializeSession(session) {
   return JSON.stringify(session);
 }
 
-export function restoreSession(json) {
+/**
+ * Restore a session saved by serializeSession. When a configuration is given,
+ * a session that began under another mode or study version is not restored.
+ */
+export function restoreSession(json, config) {
   if (!json) return null;
   try {
     const s = JSON.parse(json);
-    if (!s || s.schema !== 1 || typeof s.step !== "string") return null;
+    if (!s || s.schema !== 2 || typeof s.step !== "string") return null;
+    if (config && !sessionMatchesConfig(s, config)) return null;
     if (!s.marks) s.marks = {};
     if (!s.submission) s.submission = { status: "not_started", error: null, attempts: 0 };
     // A reload while a save was in flight: treat as failed so the retry button appears.

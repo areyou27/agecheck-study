@@ -32,7 +32,7 @@ export function synthesizeRecord(config, { condition, pathway, random = Math.ran
   const clock = fakeClock(random);
   const opts = () => ({ now: clock.now });
   const demoConfig = { ...config, mode: "preview", preview: { allowForcedCondition: true } };
-  let s = E.createSession(opts());
+  const s = E.createSession(demoConfig, opts());
   clock.advance(2000, 8000);
   E.begin(s, opts());
   clock.advance(3000, 12000);

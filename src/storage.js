@@ -11,15 +11,24 @@
 //                   server in server/ (or a compatible service), which
 //                   validates them and keeps them outside the frontend.
 //
-// Demo and research records never share a key, a store, or an export.
+// Demo and research records never share a key, a store, or an export, and
+// each store refuses records of the other kind.
+//
+// Every store follows the same rule when a record arrives for a response it
+// already holds (resolveSave in data-dictionary.js): newer progress replaces
+// older, a late save never undoes newer progress, and a withdrawal replaces
+// everything and is replaced by nothing.
 
-import { mergeConfig, DEFAULT_STUDY_CONFIG } from "./study-config.js";
+import { parseConfig, mergeConfig, retainsPartialResponses } from "./study-config.js";
+import { resolveSave } from "./data-dictionary.js";
 
 export const KEYS = {
   config: "agecheck.config.v1",
+  configDraft: "agecheck.config.draft.v1",
   demoRecords: "agecheck.demo.records.v1",
   researchRecords: "agecheck.research.records.v1",
   session: "agecheck.session.v1",
+  drafts: "agecheck.drafts.v1",
   adminToken: "agecheck.admin.token.v1",
 };
 
@@ -48,16 +57,32 @@ function safeRemove(storage, key) {
   }
 }
 
+function readJson(storage, key, fallback) {
+  const raw = safeGet(storage, key);
+  if (!raw) return fallback;
+  try {
+    const value = JSON.parse(raw);
+    return value && typeof value === "object" ? value : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 
+/**
+ * The configuration saved in this browser by the researcher dashboard, or
+ * null when there is none. Returns { config, problems }: config is null when
+ * what is stored cannot be read as a configuration at all.
+ */
 export function loadLocalConfig() {
   const raw = safeGet(globalThis.localStorage, KEYS.config);
   if (!raw) return null;
   try {
-    return mergeConfig(JSON.parse(raw));
+    return parseConfig(JSON.parse(raw));
   } catch {
-    return null;
+    return { config: null, problems: ["The configuration saved in this browser could not be read."] };
   }
 }
 
@@ -75,28 +100,38 @@ export function clearLocalConfig() {
  *      or one served by the reference server)
  *   2. this browser's saved configuration (set in the researcher dashboard)
  *   3. the built-in defaults (preview mode)
+ *
+ * Returns { config, source, problems }. Whatever its source, the
+ * configuration is validated before use. When problems is not empty the app
+ * must not run participants: it does not fall back to another source, because
+ * that would hide a broken deployment.
  */
 export async function resolveConfig({ fetchImpl = globalThis.fetch } = {}) {
   if (fetchImpl) {
+    let res = null;
     try {
-      const res = await fetchImpl("./study.config.json", { cache: "no-store" });
-      if (res.ok) {
-        const json = await res.json();
-        if (json && typeof json === "object" && json.schemaVersion === DEFAULT_STUDY_CONFIG.schemaVersion) {
-          return { config: mergeConfig(json), source: "file" };
-        }
-      }
+      res = await fetchImpl("./study.config.json", { cache: "no-store" });
     } catch {
-      /* no file; fall through */
+      res = null; // no file reachable; fall through
+    }
+    if (res && res.ok) {
+      let json;
+      try {
+        json = await res.json();
+      } catch {
+        return { config: mergeConfig(null), source: "file", problems: ["The served study.config.json is not valid JSON."] };
+      }
+      const parsed = parseConfig(json);
+      return { config: parsed.config || mergeConfig(null), source: "file", problems: parsed.problems };
     }
   }
   const local = loadLocalConfig();
-  if (local) return { config: local, source: "local" };
-  return { config: mergeConfig(null), source: "default" };
+  if (local) return { config: local.config || mergeConfig(null), source: "local", problems: local.problems };
+  return { config: mergeConfig(null), source: "default", problems: [] };
 }
 
 // ---------------------------------------------------------------------------
-// Participant session (per tab, cleared when the tab closes)
+// Participant session and unfinished answers (per tab, cleared when the tab closes)
 
 export function loadSessionJson() {
   return safeGet(globalThis.sessionStorage, KEYS.session);
@@ -110,14 +145,57 @@ export function clearSession() {
   safeRemove(globalThis.sessionStorage, KEYS.session);
 }
 
+/**
+ * Drafts are answers typed or selected but not yet submitted: the eligibility
+ * form, the assent checkbox, and the questionnaire. They live only in this
+ * tab's session storage, separate from the session and from any record, so a
+ * refresh, the Back button, or a dialog cannot lose them. They are never sent
+ * anywhere and never become part of a record unless the participant submits.
+ */
+export function loadDrafts() {
+  return readJson(globalThis.sessionStorage, KEYS.drafts, {});
+}
+
+export function saveDrafts(drafts) {
+  return safeSet(globalThis.sessionStorage, KEYS.drafts, JSON.stringify(drafts || {}));
+}
+
+export function clearDrafts() {
+  safeRemove(globalThis.sessionStorage, KEYS.drafts);
+}
+
+/** Unsaved edits in the researcher dashboard's configuration form (this tab only). */
+export function loadConfigDraft() {
+  return readJson(globalThis.sessionStorage, KEYS.configDraft, null);
+}
+
+export function saveConfigDraft(config) {
+  return safeSet(globalThis.sessionStorage, KEYS.configDraft, JSON.stringify(config));
+}
+
+export function clearConfigDraft() {
+  safeRemove(globalThis.sessionStorage, KEYS.configDraft);
+}
+
 // ---------------------------------------------------------------------------
 // Record stores
 
+const DEMO_KINDS = ["preview_walkthrough", "synthetic_demo"];
+const RESEARCH_KINDS = ["research"];
+
 export class LocalRecordStore {
-  constructor(key, label) {
+  /**
+   * options.kinds            record kinds this store accepts
+   * options.studyVersion     when set, only records of this study version are accepted
+   * options.retainWithdrawn  false withholds responses on any withdrawn record before storing it
+   */
+  constructor(key, label, options = {}) {
     this.key = key;
     this.label = label;
     this.kind = "local";
+    this.kinds = options.kinds || DEMO_KINDS;
+    this.studyVersion = options.studyVersion || null;
+    this.retainWithdrawn = options.retainWithdrawn;
   }
 
   describe() {
@@ -125,14 +203,24 @@ export class LocalRecordStore {
   }
 
   _read() {
-    const raw = safeGet(globalThis.localStorage, this.key);
-    if (!raw) return {};
+    let raw;
     try {
-      const obj = JSON.parse(raw);
-      return obj && typeof obj === "object" ? obj : {};
+      raw = globalThis.localStorage.getItem(this.key);
     } catch {
-      return {};
+      throw new Error("This browser is blocking its local storage, so records cannot be read or saved.");
     }
+    if (!raw) return {};
+    let obj;
+    try {
+      obj = JSON.parse(raw);
+    } catch {
+      obj = null;
+    }
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+      // Never treat unreadable records as "no records": the next save would overwrite them.
+      throw new Error("The records stored in this browser could not be read. Nothing was changed.");
+    }
+    return obj;
   }
 
   _write(map) {
@@ -141,21 +229,36 @@ export class LocalRecordStore {
     }
   }
 
+  _check(record) {
+    if (!record || typeof record !== "object" || typeof record.response_id !== "string") {
+      throw new Error("That is not a record.");
+    }
+    if (!this.kinds.includes(record.record_kind)) {
+      throw new Error(`A "${record.record_kind}" record does not belong with ${this.label.toLowerCase()} records.`);
+    }
+    if (this.studyVersion && record.study_version !== this.studyVersion) {
+      throw new Error(`This record is for study version ${record.study_version}, not ${this.studyVersion}.`);
+    }
+  }
+
   async list() {
     return Object.values(this._read());
   }
 
-  /** Upsert by response_id, so repeated saves never create duplicates. */
+  /**
+   * Save by response_id. Returns { ok, outcome, duplicate } where outcome is
+   * created, updated, unchanged, or superseded (see resolveSave). Repeated or
+   * late saves never create a second record and never undo newer progress.
+   */
   async save(record) {
+    this._check(record);
     const map = this._read();
-    const existing = map[record.response_id];
-    if (existing && existing.submission_status === "submitted" && record.submission_status !== "submitted") {
-      // Never downgrade a submitted record.
-      return { ok: true, duplicate: true };
+    const decision = resolveSave(map[record.response_id], record, { retainWithdrawn: this.retainWithdrawn });
+    if (decision.outcome === "created" || decision.outcome === "updated") {
+      map[record.response_id] = decision.record;
+      this._write(map);
     }
-    map[record.response_id] = record;
-    this._write(map);
-    return { ok: true, duplicate: Boolean(existing) };
+    return { ok: true, outcome: decision.outcome, duplicate: decision.outcome !== "created" };
   }
 
   async deleteByCode(code) {
@@ -168,7 +271,7 @@ export class LocalRecordStore {
         removed += 1;
       }
     }
-    this._write(map);
+    if (removed) this._write(map);
     return { removed };
   }
 
@@ -178,10 +281,10 @@ export class LocalRecordStore {
 }
 
 export class RemoteRecordStore {
-  constructor({ endpointUrl, submitToken, fetchImpl = globalThis.fetch }) {
+  constructor({ endpointUrl, submitToken, fetchImpl }) {
     this.base = String(endpointUrl || "").replace(/\/+$/, "");
     this.submitToken = submitToken || "";
-    this.fetchImpl = fetchImpl;
+    this.fetchImpl = fetchImpl || null;
     this.kind = "remote";
   }
 
@@ -194,9 +297,10 @@ export class RemoteRecordStore {
     if (body !== undefined) headers["Content-Type"] = "application/json";
     if (this.submitToken && path === "/api/submit") headers["X-Study-Token"] = this.submitToken;
     if (adminToken) headers.Authorization = `Bearer ${adminToken}`;
+    const doFetch = this.fetchImpl || globalThis.fetch.bind(globalThis);
     let res;
     try {
-      res = await this.fetchImpl(this.base + path, {
+      res = await doFetch(this.base + path, {
         method,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
@@ -213,14 +317,17 @@ export class RemoteRecordStore {
     }
     if (!res.ok) {
       const msg = data && data.error ? data.error : `The server responded with status ${res.status}.`;
-      throw new Error(msg);
+      const err = new Error(msg);
+      err.status = res.status;
+      err.problems = data && Array.isArray(data.problems) ? data.problems : [];
+      throw err;
     }
     return data || {};
   }
 
   async save(record) {
     const data = await this._request("/api/submit", { method: "POST", body: record });
-    return { ok: true, duplicate: Boolean(data.duplicate) };
+    return { ok: true, outcome: data.outcome || (data.duplicate ? "unchanged" : "created"), duplicate: Boolean(data.duplicate) };
   }
 
   async list(adminToken) {
@@ -242,23 +349,33 @@ export class RemoteRecordStore {
   }
 }
 
+/** Demo records: preview walkthroughs and synthetic data. Never research records. */
+export function demoStore(config) {
+  return new LocalRecordStore(KEYS.demoRecords, "Preview (demo) storage", {
+    kinds: DEMO_KINDS,
+    retainWithdrawn: config ? retainsPartialResponses(config) : undefined,
+  });
+}
+
+/** Research records kept on this device, for the given research configuration. */
+export function localResearchStore(config) {
+  return new LocalRecordStore(KEYS.researchRecords, "Local-device research storage", {
+    kinds: RESEARCH_KINDS,
+    studyVersion: config ? config.studyVersion : null,
+    retainWithdrawn: config ? retainsPartialResponses(config) : undefined,
+  });
+}
+
 /** The store the participant app writes to for the active configuration. */
 export function participantStore(config, { fetchImpl } = {}) {
-  if (config.mode !== "research") {
-    return new LocalRecordStore(KEYS.demoRecords, "Preview (demo) storage");
-  }
+  if (config.mode !== "research") return demoStore(config);
   const s = config.storage || {};
   if (s.adapter === "remote-endpoint") {
     return new RemoteRecordStore({ endpointUrl: s.endpointUrl, submitToken: s.submitToken, fetchImpl });
   }
-  if (s.adapter === "local-device") {
-    return new LocalRecordStore(KEYS.researchRecords, "Local-device research storage");
-  }
+  if (s.adapter === "local-device") return localResearchStore(config);
   return null; // research mode without storage: collection is disabled
 }
-
-export const demoStore = () => new LocalRecordStore(KEYS.demoRecords, "Preview (demo) storage");
-export const localResearchStore = () => new LocalRecordStore(KEYS.researchRecords, "Local-device research storage");
 
 // ---------------------------------------------------------------------------
 // Admin token for the dashboard (session only, never written to the page)

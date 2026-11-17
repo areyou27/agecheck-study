@@ -2,8 +2,11 @@
 //
 // Renders one step at a time from the session state (src/engine.js) and
 // persists the session in sessionStorage so a refresh or back navigation
-// returns to the same step with the same condition. Records are written
-// through the store chosen by the active configuration (src/storage.js).
+// returns to the same step with the same condition. Unfinished answers are
+// kept separately as drafts (also in this tab's sessionStorage) so a refresh,
+// the Back button, or a dialog cannot lose them. Records are written through
+// the store chosen by the active configuration (src/storage.js), one save at
+// a time, at every milestone.
 //
 // This file never requests camera or microphone access, never creates an
 // upload field, and never reads anything from the device beyond its own
@@ -11,17 +14,30 @@
 
 import * as E from "./engine.js";
 import { ageCategories } from "./study-config.js";
-import { resolveConfig, participantStore, loadSessionJson, saveSessionJson, clearSession } from "./storage.js";
+import {
+  resolveConfig,
+  participantStore,
+  loadSessionJson,
+  saveSessionJson,
+  clearSession,
+  loadDrafts,
+  saveDrafts,
+  clearDrafts,
+} from "./storage.js";
 
 const root = document.getElementById("app");
 const headerRight = document.getElementById("header-right");
+const syncBox = document.getElementById("sync-status");
+const dialog = document.getElementById("withdraw-dialog");
 
 let config = null;
 let configSource = "default";
 let store = null;
 let session = null;
-let ui = { confirmingWithdraw: false, error: null };
+let drafts = {};
 let simulationTimer = null;
+let saveChain = Promise.resolve();
+let sync = { state: "idle", error: null };
 const params = new URLSearchParams(location.search);
 
 // ---------------------------------------------------------------------------
@@ -45,6 +61,10 @@ function paragraphs(text) {
     .join("");
 }
 
+function messageOf(err) {
+  return err && err.message ? err.message : "The save did not go through.";
+}
+
 function persist() {
   saveSessionJson(E.serializeSession(session));
 }
@@ -59,16 +79,6 @@ function forcedConditionFromUrl() {
   if (v === "advance" || v === "advance_notice") return E.CONDITION.ADVANCE;
   if (v === "later" || v === "later_notice") return E.CONDITION.LATER;
   return null;
-}
-
-/** Save the current record quietly at milestones. Errors here are not fatal; the final submission reports errors. */
-async function saveProgress() {
-  if (!store || !E.hasRecord(session)) return;
-  try {
-    await store.save(E.buildRecord(session, config));
-  } catch {
-    /* reported at submission time */
-  }
 }
 
 function focusHeading() {
@@ -88,8 +98,135 @@ function keepHistoryOnPage() {
   }
 }
 
+function startFreshSession() {
+  clearSession();
+  clearDrafts();
+  drafts = {};
+  session = E.createSession(config);
+  sync = { state: "idle", error: null };
+}
+
 // ---------------------------------------------------------------------------
-// Header
+// Saving. One save at a time, always of the record as it stands when the save
+// actually runs, so a slow or failed request can never be followed by an older
+// one. The stores apply the same ordering to anything that still arrives late.
+
+function enqueueSave() {
+  const run = saveChain.then(async () => {
+    if (!store || !E.hasRecord(session)) return { ok: true, outcome: "skipped" };
+    return store.save(E.buildRecord(session, config));
+  });
+  saveChain = run.then(
+    () => {},
+    () => {}
+  );
+  return run;
+}
+
+/** Save progress at a milestone. A failure is shown to the participant, never hidden, and the next save retries. */
+async function saveMilestone() {
+  if (!store || !E.hasRecord(session)) return;
+  try {
+    await enqueueSave();
+    if (sync.state === "failed") setSync("idle");
+  } catch (err) {
+    if (session.step !== "withdrawn" && session.submission.status !== "submitted") setSync("failed", messageOf(err));
+  }
+}
+
+function setSync(state, error = null) {
+  sync = { state, error };
+  renderSync();
+}
+
+function renderSync() {
+  const show = sync.state === "failed" && session && E.hasRecord(session) && session.step !== "withdrawn";
+  if (!show) {
+    syncBox.hidden = true;
+    syncBox.innerHTML = "";
+    return;
+  }
+  syncBox.hidden = false;
+  syncBox.innerHTML = `
+    <div class="notice-box danger" role="alert">
+      <p class="tight"><strong>Your progress has not reached the study's records yet.</strong> ${esc(sync.error)}</p>
+      <p class="small tight">It is still safe on this page, and it will be sent again at the next step. You can keep going.</p>
+      <div class="actions"><button type="button" class="btn btn-secondary" id="sync-retry">Try saving again</button></div>
+    </div>`;
+  syncBox.querySelector("#sync-retry").addEventListener("click", () => saveMilestone());
+}
+
+// ---------------------------------------------------------------------------
+// Drafts: unfinished answers, kept apart from the session and from any record.
+
+function storeDrafts() {
+  saveDrafts(drafts);
+}
+
+function readAnswers(form) {
+  const data = new FormData(form);
+  const answers = {};
+  for (const [key, value] of data.entries()) {
+    if (key === "stop_reasons") {
+      (answers.stop_reasons ||= []).push(String(value));
+    } else {
+      answers[key] = String(value);
+    }
+  }
+  return answers;
+}
+
+function captureDraft(form) {
+  if (!form) return;
+  if (form.id === "questionnaire-form") {
+    drafts.questionnaire = readAnswers(form);
+    updateClearButtons(form);
+  } else if (form.id === "eligibility-form") {
+    const age = form.querySelector('input[name="ageCategory"]:checked');
+    const code = form.querySelector('input[name="recruitmentCode"]');
+    drafts.eligibility = {
+      ageCategory: age ? age.value : "",
+      meetsCriteria: form.querySelector('input[name="meetsCriteria"]').checked,
+      recruitmentCode: code ? code.value : "",
+    };
+  } else if (form.id === "consent-form") {
+    drafts.consent = { assent: form.querySelector('input[name="assent"]').checked };
+  } else {
+    return;
+  }
+  storeDrafts();
+}
+
+function dropDraft(name) {
+  if (drafts[name] === undefined) return;
+  delete drafts[name];
+  storeDrafts();
+}
+
+function applyAnswers(form, answers) {
+  for (const [key, value] of Object.entries(answers || {})) {
+    if (Array.isArray(value)) {
+      for (const v of value) {
+        const box = form.querySelector(`input[name="${CSS.escape(key)}"][value="${CSS.escape(v)}"]`);
+        if (box) box.checked = true;
+      }
+    } else {
+      const radio = form.querySelector(`input[name="${CSS.escape(key)}"][value="${CSS.escape(value)}"]`);
+      if (radio) radio.checked = true;
+      const ta = form.querySelector(`textarea[name="${CSS.escape(key)}"]`);
+      if (ta) ta.value = value;
+    }
+  }
+}
+
+function updateClearButtons(form) {
+  for (const btn of form.querySelectorAll("[data-clear]")) {
+    btn.disabled = !form.querySelector(`input[name="${CSS.escape(btn.dataset.clear)}"]:checked`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Header and the withdrawal dialog
 
 function renderHeader() {
   const parts = [];
@@ -103,12 +240,96 @@ function renderHeader() {
   }
   headerRight.innerHTML = parts.join("");
   const w = headerRight.querySelector("#withdraw-link");
-  if (w) {
-    w.addEventListener("click", () => {
-      ui.confirmingWithdraw = true;
-      render();
-    });
+  if (w) w.addEventListener("click", openWithdrawDialog);
+}
+
+function setupDialog() {
+  const w = config.withdrawal;
+  dialog.querySelector("#withdraw-title").textContent = w.heading;
+  dialog.querySelector("#withdraw-body").innerHTML = paragraphs(w.body);
+  const cancel = dialog.querySelector("#withdraw-cancel");
+  const confirm = dialog.querySelector("#withdraw-confirm");
+  cancel.textContent = w.cancelLabel;
+  confirm.textContent = w.confirmLabel;
+  cancel.addEventListener("click", () => dialog.close("cancel"));
+  confirm.addEventListener("click", () => {
+    dialog.close("confirm");
+    confirmWithdraw();
+  });
+  // Closing without confirming (the button, or Escape) hands focus back to
+  // the control that opened the dialog. Nothing on the page was re-rendered,
+  // so everything the participant had entered is exactly as they left it.
+  dialog.addEventListener("close", () => {
+    if (dialog.returnValue === "confirm") return;
+    const opener = document.getElementById("withdraw-link");
+    if (opener) opener.focus();
+    else focusHeading();
+  });
+}
+
+function openWithdrawDialog() {
+  if (!E.canWithdraw(session) || dialog.open) return;
+  if (typeof dialog.showModal !== "function") {
+    // Very old browsers: fall back to the browser's own confirmation box.
+    if (window.confirm(`${config.withdrawal.heading}\n\n${config.withdrawal.body}`)) confirmWithdraw();
+    return;
   }
+  dialog.returnValue = "";
+  dialog.showModal(); // modal: the page behind is inert and focus cannot leave
+  dialog.querySelector("#withdraw-cancel").focus();
+}
+
+/** Withdrawal ends participation at once. Saving it is tracked separately and can be retried. */
+async function confirmWithdraw() {
+  if (!E.canWithdraw(session)) return;
+  E.withdraw(session);
+  drafts = {};
+  clearDrafts();
+  sync = { state: "idle", error: null };
+  persist();
+  render();
+  await saveWithdrawal();
+}
+
+async function saveWithdrawal() {
+  if (session.step !== "withdrawn") return;
+  E.markWithdrawalPending(session);
+  persist();
+  renderWithdrawalStatus();
+  try {
+    if (!store) throw new Error("No storage is configured.");
+    await enqueueSave();
+    E.markWithdrawalSaved(session);
+  } catch (err) {
+    E.markWithdrawalFailed(session, messageOf(err));
+  }
+  persist();
+  renderWithdrawalStatus();
+}
+
+function withdrawalStatusHtml() {
+  if (session.withdrawalSync === "saved") {
+    return `<p class="notice-box" id="withdrawal-state" data-state="saved"><strong>Your withdrawal has been saved.</strong></p>`;
+  }
+  if (session.withdrawalSync === "failed") {
+    return `
+      <div class="notice-box danger" id="withdrawal-state" data-state="failed" role="alert">
+        <p class="tight"><strong>Your withdrawal has not reached the study's records yet.</strong> ${esc(session.withdrawalError)}</p>
+        <p class="small tight">You are no longer taking part, and nothing more is being collected. Keep this page open and try again. If it keeps failing, give the researcher your response code so the record can be removed by hand.</p>
+        <div class="actions"><button type="button" class="btn" id="withdrawal-retry">Try saving again</button></div>
+      </div>`;
+  }
+  return `<p class="notice-box warn" id="withdrawal-state" data-state="pending">Saving your withdrawal to the study's records. Keep this page open for a moment.</p>`;
+}
+
+function renderWithdrawalStatus() {
+  const box = root.querySelector("#withdrawal-status");
+  if (!box || session.step !== "withdrawn") return;
+  box.innerHTML = withdrawalStatusHtml();
+  const retry = box.querySelector("#withdrawal-retry");
+  if (retry) retry.addEventListener("click", () => saveWithdrawal());
+  const actions = root.querySelector("#withdrawn-actions");
+  if (actions) actions.hidden = session.withdrawalSync !== "saved";
 }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +449,14 @@ function viewScenario() {
 function viewVerification() {
   const v = config.verification;
   const advance = session.condition === E.CONDITION.ADVANCE;
-  const notice = advance ? `<p id="notice-sentence">${esc(v.advanceNoticeSentence)}</p>` : "";
+  // The advance-notice group reads the sentence. The later-notice group gets
+  // the same sentence as an invisible, inert spacer: it takes exactly the room
+  // the real one would at any screen width or text size, so the buttons sit in
+  // the same place in both conditions, and it is hidden from sight, from
+  // screen readers, and from the page's readable text.
+  const notice = advance
+    ? `<p class="notice-text" id="notice-sentence">${esc(v.advanceNoticeSentence)}</p>`
+    : `<p class="notice-text notice-reserve" aria-hidden="true">${esc(v.advanceNoticeSentence)}</p>`;
   return `
     <section class="card">
       ${platformFrame(`
@@ -301,6 +529,12 @@ function viewConfirmation() {
     </section>`;
 }
 
+// Returns a single-choice answer to blank. Always takes up its line (so nothing
+// jumps when it appears) and is only reachable once there is an answer to clear.
+function clearButton(item) {
+  return `<div class="clear-row"><button type="button" class="link-btn clear-answer" data-clear="${esc(item.id)}" aria-label="Clear answer: ${esc(item.text)}" disabled>Clear answer</button></div>`;
+}
+
 function likertItem(item, scale) {
   return `
     <fieldset class="likert" data-item="${esc(item.id)}">
@@ -312,6 +546,7 @@ function likertItem(item, scale) {
           )
           .join("")}
       </div>
+      ${clearButton(item)}
     </fieldset>`;
 }
 
@@ -325,6 +560,7 @@ function choiceItem(item, { multiple = false } = {}) {
           .map((o) => `<label class="choice"><input type="${type}" name="${esc(item.id)}" value="${esc(o.value)}" /> <span>${esc(o.label)}</span></label>`)
           .join("")}
       </div>
+      ${multiple ? "" : clearButton(item)}
     </fieldset>`;
 }
 
@@ -369,7 +605,7 @@ function viewQuestionnaire() {
             ${submitting ? "Submitting…" : failed ? "Try again" : esc(q.submitLabel)}
           </button>
         </div>
-        <p class="help">You can leave any question blank.</p>
+        <p class="help">You can leave any question blank. Your answers stay on this page until you submit them.</p>
       </form>
     </section>`;
 }
@@ -406,8 +642,11 @@ function viewWithdrawn() {
     <section class="card">
       <h1>Withdrawn</h1>
       ${paragraphs(config.withdrawal.withdrawnMessage)}
-      <p class="muted small">Response code for any later request about this session: <strong>${esc(session.responseCode)}</strong></p>
-      <div class="actions"><button type="button" class="btn btn-secondary" id="new-session">Start a new session on this device</button></div>
+      <div id="withdrawal-status" role="status" aria-live="polite">${withdrawalStatusHtml()}</div>
+      <p class="muted small">Response code for any later request about this session: <strong id="withdrawn-code">${esc(session.responseCode)}</strong></p>
+      <div class="actions" id="withdrawn-actions" ${session.withdrawalSync === "saved" ? "" : "hidden"}>
+        <button type="button" class="btn btn-secondary" id="new-session">Start a new session on this device</button>
+      </div>
     </section>`;
 }
 
@@ -419,19 +658,23 @@ function viewCollectionDisabled() {
     </section>`;
 }
 
-function withdrawDialog() {
-  const w = config.withdrawal;
+// The configuration failed its checks. Visitors to a deployed page get a plain
+// message; the reasons go to the console. On the researcher's own browser the
+// reasons are listed, since the configuration there is theirs to fix.
+function viewUnavailable(problems, source) {
+  const detail =
+    source === "file"
+      ? ""
+      : `<div class="notice-box warn"><p class="tight"><strong>For the researcher:</strong> the configuration saved in this browser did not pass its checks. Open the researcher dashboard to fix it.</p><ul>${problems
+          .slice(0, 12)
+          .map((p) => `<li>${esc(p)}</li>`)
+          .join("")}</ul></div>`;
   return `
-    <div class="overlay" id="withdraw-overlay">
-      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="withdraw-title">
-        <h2 id="withdraw-title">${esc(w.heading)}</h2>
-        ${paragraphs(w.body)}
-        <div class="actions">
-          <button type="button" class="btn btn-secondary" id="withdraw-cancel">${esc(w.cancelLabel)}</button>
-          <button type="button" class="btn" id="withdraw-confirm">${esc(w.confirmLabel)}</button>
-        </div>
-      </div>
-    </div>`;
+    <section class="card">
+      <h1>This study page is not available right now</h1>
+      <p>Nothing has been recorded. Please tell the person who gave you this link.</p>
+      ${detail}
+    </section>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +687,7 @@ function render() {
   }
   renderHeader();
   keepHistoryOnPage();
+  renderSync();
 
   if (!isPreview() && !store) {
     root.innerHTML = viewCollectionDisabled();
@@ -467,12 +711,14 @@ function render() {
     withdrawn: viewWithdrawn,
   };
   const view = views[session.step] || viewIntro;
-  root.innerHTML = view() + (ui.confirmingWithdraw ? withdrawDialog() : "");
+  root.innerHTML = view();
   root.dataset.step = session.step;
   renderedAt = performance.now();
   wire();
-  if (ui.confirmingWithdraw) {
-    root.querySelector("#withdraw-cancel").focus();
+  if (dialog.open) {
+    // The step changed underneath an open dialog (for example a submission
+    // finished). Withdrawal may no longer apply; if so, close it.
+    if (!E.canWithdraw(session)) dialog.close("cancel");
   } else {
     focusHeading();
   }
@@ -504,6 +750,17 @@ function wire() {
     render();
   });
 
+  const eligibility = root.querySelector("#eligibility-form");
+  if (eligibility && drafts.eligibility) {
+    const d = drafts.eligibility;
+    if (d.ageCategory) {
+      const radio = eligibility.querySelector(`input[name="ageCategory"][value="${CSS.escape(d.ageCategory)}"]`);
+      if (radio) radio.checked = true;
+    }
+    eligibility.querySelector('input[name="meetsCriteria"]').checked = d.meetsCriteria === true;
+    const code = eligibility.querySelector('input[name="recruitmentCode"]');
+    if (code && d.recruitmentCode) code.value = d.recruitmentCode;
+  }
   on("eligibility-form", "submit", (ev) => {
     ev.preventDefault();
     const form = ev.currentTarget;
@@ -521,11 +778,14 @@ function wire() {
       meetsCriteria: form.querySelector('input[name="meetsCriteria"]').checked,
       recruitmentCode: codeEl ? codeEl.value : null,
     });
+    dropDraft("eligibility"); // answered; an ineligible visitor's answers are not kept anywhere
     persist();
     render();
   });
 
-  on("consent-form", "submit", async (ev) => {
+  const consent = root.querySelector("#consent-form");
+  if (consent && drafts.consent) consent.querySelector('input[name="assent"]').checked = drafts.consent.assent === true;
+  on("consent-form", "submit", (ev) => {
     ev.preventDefault();
     const form = ev.currentTarget;
     const err = form.querySelector("#consent-error");
@@ -536,13 +796,15 @@ function wire() {
       return;
     }
     E.giveAssent(session, config, { forcedCondition: forcedConditionFromUrl() });
+    dropDraft("consent");
     persist();
     render();
-    await saveProgress();
+    saveMilestone();
   });
 
   on("consent-decline", "click", () => {
     E.declineAssent(session);
+    dropDraft("consent");
     persist();
     render();
   });
@@ -554,36 +816,40 @@ function wire() {
   });
 
   if (session.step === "verification") {
-    // The card for the assigned condition is now in the DOM.
-    E.confirmVerificationDisplayed(session);
-    persist();
-    on("verify-start", "click", async () => {
+    // The card for the assigned condition is now in the DOM. Save that
+    // milestone right away, so someone who leaves on this screen is still
+    // recorded as having seen it.
+    if (E.confirmVerificationDisplayed(session)) {
+      persist();
+      saveMilestone();
+    }
+    on("verify-start", "click", () => {
       E.initialDecision(session, E.INITIAL.START);
       persist();
       render();
-      await saveProgress();
+      saveMilestone();
     });
-    on("verify-decline", "click", async () => {
+    on("verify-decline", "click", () => {
       E.initialDecision(session, E.INITIAL.DECLINE);
       persist();
       render();
-      await saveProgress();
+      saveMilestone();
     });
   }
 
   if (session.step === "simulation") runSimulation();
 
-  on("id-continue", "click", async () => {
+  on("id-continue", "click", () => {
     E.idDecision(session, E.ID.CONTINUE);
     persist();
     render();
-    await saveProgress();
+    saveMilestone();
   });
-  on("id-stop", "click", async () => {
+  on("id-stop", "click", () => {
     E.idDecision(session, E.ID.STOP);
     persist();
     render();
-    await saveProgress();
+    saveMilestone();
   });
 
   on("to-questionnaire", "click", () => {
@@ -592,11 +858,23 @@ function wire() {
     render();
   });
 
-  if (session.step === "questionnaire") {
-    restoreAnswers();
-    on("questionnaire-form", "submit", (ev) => {
+  const questionnaire = root.querySelector("#questionnaire-form");
+  if (questionnaire) {
+    // Drafts first; after a failed submission they are the same answers anyway.
+    applyAnswers(questionnaire, drafts.questionnaire || session.questionnaire);
+    updateClearButtons(questionnaire);
+    for (const btn of questionnaire.querySelectorAll("[data-clear]")) {
+      btn.addEventListener("click", () => {
+        const name = btn.dataset.clear;
+        const radios = questionnaire.querySelectorAll(`input[name="${CSS.escape(name)}"]`);
+        for (const r of radios) r.checked = false;
+        captureDraft(questionnaire);
+        if (radios.length) radios[0].focus();
+      });
+    }
+    questionnaire.addEventListener("submit", (ev) => {
       ev.preventDefault();
-      submitAnswers(readAnswers(ev.currentTarget));
+      submitAnswers(readAnswers(questionnaire));
     });
   }
 
@@ -607,31 +885,12 @@ function wire() {
   });
 
   on("new-session", "click", () => {
-    clearSession();
-    session = E.createSession();
-    ui = { confirmingWithdraw: false, error: null };
+    startFreshSession();
+    persist();
     render();
   });
 
-  on("withdraw-cancel", "click", () => {
-    ui.confirmingWithdraw = false;
-    render();
-  });
-  on("withdraw-confirm", "click", async () => {
-    ui.confirmingWithdraw = false;
-    E.withdraw(session);
-    persist();
-    render();
-    await saveProgress();
-  });
-  if (ui.confirmingWithdraw) {
-    root.querySelector("#withdraw-overlay").addEventListener("keydown", (ev) => {
-      if (ev.key === "Escape") {
-        ui.confirmingWithdraw = false;
-        render();
-      }
-    });
-  }
+  on("withdrawal-retry", "click", () => saveWithdrawal());
 }
 
 function runSimulation() {
@@ -657,58 +916,35 @@ function runSimulation() {
     E.simulationComplete(session);
     persist();
     render();
+    // Reaching the uncertain result and ID prompt is a milestone of its own.
+    saveMilestone();
   }, duration);
-}
-
-function readAnswers(form) {
-  const data = new FormData(form);
-  const answers = {};
-  for (const [key, value] of data.entries()) {
-    if (key === "stop_reasons") {
-      (answers.stop_reasons ||= []).push(String(value));
-    } else {
-      answers[key] = String(value);
-    }
-  }
-  return answers;
-}
-
-function restoreAnswers() {
-  const prev = session.questionnaire;
-  if (!prev) return;
-  const form = root.querySelector("#questionnaire-form");
-  for (const [key, value] of Object.entries(prev)) {
-    if (Array.isArray(value)) {
-      for (const v of value) {
-        const box = form.querySelector(`input[name="${key}"][value="${CSS.escape(v)}"]`);
-        if (box) box.checked = true;
-      }
-    } else {
-      const radio = form.querySelector(`input[name="${key}"][value="${CSS.escape(value)}"]`);
-      if (radio) radio.checked = true;
-      const ta = form.querySelector(`textarea[name="${key}"]`);
-      if (ta) ta.value = value;
-    }
-  }
 }
 
 async function submitAnswers(answers) {
   const before = session.submission.status;
   if (before === "submitting" || before === "submitted") return;
-  if (before === "failed") E.retrySubmit(session);
+  if (before === "failed") E.retrySubmit(session, answers);
   else E.submitQuestionnaire(session, answers);
-  if (before === "failed") session.questionnaire = E.sanitizeAnswers(answers);
+  drafts.questionnaire = answers;
+  storeDrafts();
+  if (sync.state === "failed") sync = { state: "idle", error: null }; // this save reports its own result below
   persist();
   render();
+  let done = false;
   try {
     if (isPreview() && params.get("failSubmit") === "1" && session.submission.attempts === 1) {
       throw new Error("Simulated submission failure (preview test hook).");
     }
-    await store.save(E.buildRecord(session, config));
-    E.markSubmitted(session);
+    await enqueueSave();
+    done = E.markSubmitted(session);
   } catch (err) {
-    E.markSubmitFailed(session, err && err.message ? err.message : "Submission failed.");
+    E.markSubmitFailed(session, messageOf(err));
   }
+  // If the participant withdrew while the save was in flight, the session has
+  // already moved on and the withdrawal's own save follows this one.
+  if (session.step === "withdrawn") return;
+  if (done) dropDraft("questionnaire"); // submitted: no longer a draft
   persist();
   render();
 }
@@ -720,27 +956,65 @@ async function init() {
   const resolved = await resolveConfig();
   config = resolved.config;
   configSource = resolved.source;
-  store = participantStore(config);
   document.title = config.appName;
+
+  root.dataset.mode = config.mode;
+  root.dataset.configSource = configSource;
+  root.dataset.studyVersion = config.studyVersion;
+
+  if (resolved.problems.length) {
+    // A configuration that fails its checks never runs participants.
+    root.dataset.blocked = "true";
+    if (window.console && console.warn) console.warn(`AgeCheck Study configuration problems (${configSource}):\n- ${resolved.problems.join("\n- ")}`);
+    headerRight.innerHTML = "";
+    root.innerHTML = viewUnavailable(resolved.problems, configSource);
+    return;
+  }
+
+  store = participantStore(config);
 
   if (params.get("reset") === "1") {
     clearSession();
+    clearDrafts();
     params.delete("reset");
     const qs = params.toString();
     history.replaceState(null, "", location.pathname + (qs ? `?${qs}` : ""));
   }
-  session = E.restoreSession(loadSessionJson()) || E.createSession();
 
-  // Diagnostics for the researcher, nothing personal.
-  root.dataset.mode = config.mode;
-  root.dataset.configSource = configSource;
-  root.dataset.studyVersion = config.studyVersion;
+  // A saved session only continues under the mode and study version it began
+  // with. Anything else (for example a preview run left in this tab before
+  // research mode was activated) is dropped, drafts included.
+  const saved = loadSessionJson();
+  session = E.restoreSession(saved, config);
+  if (!session) {
+    if (saved) clearDrafts();
+    session = E.createSession(config);
+    if (saved) persist();
+  }
+  drafts = loadDrafts();
+
+  setupDialog();
+
+  // Every change to a form is kept as a draft straight away.
+  const onFormChange = (ev) => captureDraft(ev.target && ev.target.closest ? ev.target.closest("form") : null);
+  root.addEventListener("input", onFormChange);
+  root.addEventListener("change", onFormChange);
 
   window.addEventListener("popstate", () => {
     if (E.hasRecord(session)) history.pushState({ agecheck: true }, "");
     render();
   });
+
   render();
+
+  // After a reload, bring the storage up to date with what this tab knows.
+  if (E.hasRecord(session)) {
+    if (session.step === "withdrawn") {
+      if (session.withdrawalSync !== "saved") saveWithdrawal();
+    } else if (session.submission.status !== "submitted") {
+      saveMilestone();
+    }
+  }
 }
 
 init().catch((err) => {

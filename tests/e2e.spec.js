@@ -1,111 +1,50 @@
-// End-to-end tests for AgeCheck Study (Playwright).
+// End-to-end tests for AgeCheck Study (Playwright): the core study flow.
 // Run with: npm run test:e2e
 //
 // Each test gets a fresh browser context, so localStorage and sessionStorage
 // start empty. The participant app runs in preview mode here, so records
 // land in the demo store as preview_walkthrough records.
+// The regression tests for saving, withdrawal, drafts, layout, and the
+// dashboard are in regression.spec.js.
 
 import { test, expect } from "@playwright/test";
-import { DEFAULT_STUDY_CONFIG, cloneConfig } from "../src/study-config.js";
-
-const DEMO_KEY = "agecheck.demo.records.v1";
-const RESEARCH_KEY = "agecheck.research.records.v1";
-const CONFIG_KEY = "agecheck.config.v1";
-const NOTICE = "If the facial check cannot confidently confirm your age, you may be asked to provide a government-issued ID.";
-
-async function installSpies(page) {
-  await page.addInitScript(() => {
-    const calls = [];
-    window.__mediaCalls = calls;
-    const md = navigator.mediaDevices;
-    if (md) {
-      for (const fn of ["getUserMedia", "getDisplayMedia", "enumerateDevices"]) {
-        md[fn] = () => {
-          calls.push(fn);
-          return Promise.reject(new Error("blocked by test"));
-        };
-      }
-    }
-    navigator.getUserMedia = () => calls.push("legacy getUserMedia");
-    if (navigator.permissions && navigator.permissions.query) {
-      const orig = navigator.permissions.query.bind(navigator.permissions);
-      navigator.permissions.query = (d) => {
-        calls.push(`permissions.query:${d && d.name}`);
-        return orig(d);
-      };
-    }
-  });
-}
-
-async function open(page, { condition = null, extra = "" } = {}) {
-  await installSpies(page);
-  const q = ["reset=1"];
-  if (condition) q.push(`condition=${condition}`);
-  await page.goto(`/index.html?${q.join("&")}${extra}`);
-  await expect(page.getByRole("heading", { name: "About this study" })).toBeVisible();
-}
-
-async function toVerification(page) {
-  await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("heading", { name: "Before you begin" })).toBeVisible();
-  await page.getByRole("radio", { name: "16", exact: true }).check();
-  await page.getByRole("checkbox", { name: /approved Prosper-area/ }).check();
-  await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("heading", { name: "Study information and assent" })).toBeVisible();
-  await page.getByRole("checkbox", { name: /agree to take part/ }).check();
-  await page.getByRole("button", { name: "Continue", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "A fictional platform" })).toBeVisible();
-  await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("heading", { name: "Confirm your age group" })).toBeVisible();
-}
-
-async function startCheckToResult(page) {
-  await page.getByRole("button", { name: "Start simulated check" }).click();
-  await expect(page.getByText("Simulated check", { exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: /could not confidently confirm/ })).toBeVisible({ timeout: 8000 });
-  await expect(page.getByText("This is a simulation. Do not provide a real ID.")).toBeVisible();
-}
-
-async function fillAndSubmitQuestionnaire(page, { answerAll = true } = {}) {
-  await expect(page.getByRole("heading", { name: "Your experience" })).toBeVisible();
-  if (answerAll) {
-    const items = page.locator("fieldset.likert");
-    const n = await items.count();
-    for (let i = 0; i < n; i += 1) await items.nth(i).getByRole("radio").nth(3).check();
-    for (const id of ["recall_notice", "prior_experience", "id_availability", "breach_awareness"]) {
-      await page.locator(`fieldset[data-item="${id}"] input`).first().check();
-    }
-    await page.locator("#open_influence").fill("Test run. No personal details.");
-    const reasons = page.locator('fieldset[data-item="stop_reasons"] input');
-    if (await reasons.count()) await reasons.first().check();
-  }
-  await page.getByRole("button", { name: "Submit answers" }).click();
-  await expect(page.getByRole("heading", { name: "About this study" })).toBeVisible();
-  await expect(page.locator("#response-code")).toHaveText(/^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
-}
-
-async function records(page, key = DEMO_KEY) {
-  return page.evaluate((k) => Object.values(JSON.parse(localStorage.getItem(k) || "{}")), key);
-}
-
-async function assertNoDeviceAccess(page) {
-  expect(await page.evaluate(() => window.__mediaCalls)).toEqual([]);
-  expect(await page.locator('input[type="file"]').count()).toBe(0);
-  expect(await page.locator("video, canvas").count()).toBe(0);
-}
-
-// ---------------------------------------------------------------------------
+import {
+  DEMO_KEY,
+  RESEARCH_KEY,
+  NOTICE,
+  installSpies,
+  open,
+  toVerification,
+  startCheckToResult,
+  fillAndSubmitQuestionnaire,
+  records,
+  assertNoDeviceAccess,
+  researchConfig,
+  setLocalConfig,
+} from "./e2e-helpers.js";
 
 test.describe("the six pathways", () => {
   for (const condition of ["advance", "later"]) {
     const cond = condition === "advance" ? "advance_notice" : "later_notice";
 
+    // The notice is on screen for the advance group. For the later group the
+    // same sentence exists only as an invisible spacer, hidden from sight and
+    // from assistive technology.
+    const checkNotice = async (page) => {
+      if (condition === "advance") {
+        await expect(page.getByText(NOTICE)).toBeVisible();
+        expect(await page.locator(".platform").ariaSnapshot()).toContain("government-issued ID");
+      } else {
+        await expect(page.getByText(NOTICE)).toBeHidden();
+        await expect(page.locator(".notice-text")).toHaveAttribute("aria-hidden", "true");
+        expect(await page.locator(".platform").ariaSnapshot()).not.toContain("government-issued ID");
+      }
+    };
+
     test(`${condition} notice: decline initial check -> questionnaire -> debrief`, async ({ page }) => {
       await open(page, { condition });
       await toVerification(page);
-      const notice = page.getByText(NOTICE);
-      if (condition === "advance") await expect(notice).toBeVisible();
-      else await expect(notice).toHaveCount(0);
+      await checkNotice(page);
       await assertNoDeviceAccess(page);
       await page.getByRole("button", { name: "Decline verification" }).click();
       await expect(page.getByRole("heading", { name: "Your choice has been recorded." })).toBeVisible();
@@ -114,7 +53,9 @@ test.describe("the six pathways", () => {
       await expect(page.locator('fieldset[data-item="id_unexpected"]')).toHaveCount(0);
       await expect(page.locator('fieldset[data-item="stop_reasons"]')).toHaveCount(1);
       await fillAndSubmitQuestionnaire(page);
-      const [r] = await records(page);
+      const all = await records(page);
+      expect(all.length).toBe(1);
+      const r = all[0];
       expect(r.record_kind).toBe("preview_walkthrough");
       expect(r.condition).toBe(cond);
       expect(r.assignment_method).toBe("forced_preview");
@@ -132,6 +73,7 @@ test.describe("the six pathways", () => {
     test(`${condition} notice: start -> stop at ID prompt -> questionnaire -> debrief`, async ({ page }) => {
       await open(page, { condition });
       await toVerification(page);
+      await checkNotice(page);
       await startCheckToResult(page);
       await assertNoDeviceAccess(page);
       // Both choices are rendered with the same style and size.
@@ -145,7 +87,9 @@ test.describe("the six pathways", () => {
       await page.getByRole("button", { name: "Continue to the questions" }).click();
       await expect(page.locator('fieldset[data-item="id_unexpected"]')).toHaveCount(1);
       await fillAndSubmitQuestionnaire(page);
-      const [r] = await records(page);
+      const all = await records(page);
+      expect(all.length).toBe(1);
+      const r = all[0];
       expect(r.condition).toBe(cond);
       expect(r.initial_decision).toBe("start");
       expect(r.reached_uncertain_result).toBe("yes");
@@ -164,38 +108,19 @@ test.describe("the six pathways", () => {
       await page.getByRole("button", { name: "I would continue with ID verification" }).click();
       await expect(page.getByRole("heading", { name: "Your choice has been recorded. No ID is needed for this study." })).toBeVisible();
       // No fields of any kind on the confirmation screen.
-      expect(await page.locator("input, textarea, select").count()).toBe(0);
+      expect(await page.locator("#app input, #app textarea, #app select").count()).toBe(0);
       await page.getByRole("button", { name: "Continue to the questions" }).click();
       await expect(page.locator('fieldset[data-item="stop_reasons"]')).toHaveCount(0);
       await fillAndSubmitQuestionnaire(page);
-      const [r] = await records(page);
+      const all = await records(page);
+      expect(all.length).toBe(1);
+      const r = all[0];
       expect(r.condition).toBe(cond);
       expect(r.id_decision).toBe("continue");
       expect(r.final_pathway).toBe("would_continue_with_id");
       expect(r.q_stop_reasons).toBe("not_applicable");
       await assertNoDeviceAccess(page);
     });
-  }
-});
-
-test("the verification card has identical layout in both conditions", async ({ browser }) => {
-  const boxes = {};
-  for (const condition of ["advance", "later"]) {
-    const context = await browser.newContext({ viewport: { width: 1000, height: 900 } });
-    const page = await context.newPage();
-    await open(page, { condition });
-    await toVerification(page);
-    boxes[condition] = {
-      start: await page.getByRole("button", { name: "Start simulated check" }).boundingBox(),
-      decline: await page.getByRole("button", { name: "Decline verification" }).boundingBox(),
-      slot: await page.locator(".notice-slot").boundingBox(),
-    };
-    await context.close();
-  }
-  for (const k of ["start", "decline", "slot"]) {
-    expect(boxes.advance[k].y).toBeCloseTo(boxes.later[k].y, 0);
-    expect(boxes.advance[k].height).toBeCloseTo(boxes.later[k].height, 0);
-    expect(boxes.advance[k].x).toBeCloseTo(boxes.later[k].x, 0);
   }
 });
 
@@ -257,12 +182,17 @@ test("withdrawing from the study is recorded as withdrawal, not as declining ver
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
   await dialog.getByRole("button", { name: "No, go back" }).click();
+  await expect(dialog).toBeHidden();
   await expect(page.getByRole("heading", { name: "Confirm your age group" })).toBeVisible();
   await page.getByRole("button", { name: "Withdraw from study" }).click();
   await page.getByRole("dialog").getByRole("button", { name: "Yes, withdraw" }).click();
   await expect(page.getByRole("heading", { name: "Withdrawn" })).toBeVisible();
+  await expect(page.locator("#withdrawal-state")).toHaveAttribute("data-state", "saved");
+  await expect(page.getByText("Your withdrawal has been saved.")).toBeVisible();
   await expect(page.getByRole("button", { name: "Withdraw from study" })).toHaveCount(0);
-  const [r] = await records(page);
+  const rs = await records(page);
+  expect(rs.length).toBe(1);
+  const r = rs[0];
   expect(r.final_pathway).toBe("withdrawn");
   expect(r.withdrawn_at_step).toBe("verification");
   expect(r.submission_status).toBe("withdrawn");
@@ -280,7 +210,7 @@ test("withdrawal is unavailable before assent and is not confused with not takin
   await page.getByRole("button", { name: "Continue" }).click();
   await expect(page.getByText(/only open to participants who meet/)).toBeVisible();
   expect((await records(page)).length).toBe(0);
-  await open(page);
+  await open(page, { spies: false });
   await page.getByRole("button", { name: "Continue" }).click();
   await page.getByRole("radio", { name: "17", exact: true }).check();
   await page.getByRole("checkbox", { name: /approved Prosper-area/ }).check();
@@ -298,11 +228,13 @@ test("a failed submission shows a clear recovery message and a retry succeeds wi
   await page.locator("fieldset.likert").nth(1).getByRole("radio").nth(4).check();
   await page.locator("#open_influence").fill("Kept across the retry.");
   await page.getByRole("button", { name: "Submit answers" }).click();
-  const alert = page.getByRole("alert");
+  const alert = page.locator("#questionnaire-form").getByRole("alert");
   await expect(alert).toContainText("Your answers were not submitted.");
   await expect(alert).toContainText("Simulated submission failure");
   await expect(page.locator("#open_influence")).toHaveValue("Kept across the retry.");
   await expect(page.locator("fieldset.likert").nth(1).getByRole("radio").nth(4)).toBeChecked();
+  // Nothing claims to be submitted while the save has failed.
+  expect((await records(page))[0].submission_status).toBe("in_progress");
   await page.getByRole("button", { name: "Try again" }).click();
   await expect(page.getByRole("heading", { name: "About this study" })).toBeVisible();
   const rs = await records(page);
@@ -314,7 +246,7 @@ test("a failed submission shows a clear recovery message and a retry succeeds wi
 
 test("keyboard-only use through a full pathway", async ({ page }) => {
   await open(page, { condition: "advance" });
-  const pressUntil = async (predicate, max = 40) => {
+  const pressUntil = async (predicate, max = 60) => {
     for (let i = 0; i < max; i += 1) {
       const ok = await page.evaluate(predicate);
       if (ok) return;
@@ -358,12 +290,20 @@ test("keyboard-only use through a full pathway", async ({ page }) => {
   await focusInput("risk_exposure", "1");
   await page.keyboard.press("ArrowRight");
   await page.keyboard.press("ArrowRight"); // -> 3
+  // The clear-answer control is reachable by keyboard once there is an answer, and works.
+  await focusInput("risk_misuse", "1");
+  await page.keyboard.press("Space");
+  await focusText("Clear answer");
+  await expect(page.locator(":focus")).toHaveAttribute("data-clear", "risk_misuse");
+  await page.keyboard.press("Enter");
+  await expect(page.locator('input[name="risk_misuse"]:checked')).toHaveCount(0);
   await focusText("Submit answers");
   await page.keyboard.press("Enter");
   await expect(page.getByRole("heading", { name: "About this study" })).toBeVisible();
   const [r] = await records(page);
   expect(r.final_pathway).toBe("stopped_at_id_request");
   expect(r.q_risk_exposure).toBe("3");
+  expect(r.q_risk_misuse).toBe("skipped");
 });
 
 test.describe("small phone screen", () => {
@@ -408,75 +348,25 @@ test("no camera, microphone, file inputs, or third-party requests anywhere", asy
   await assertNoDeviceAccess(page);
   for (const url of requests) expect(url.startsWith(baseURL)).toBe(true);
   // The page source never references device APIs.
-  for (const file of ["/src/app.js", "/src/researcher.js", "/src/storage.js", "/src/engine.js"]) {
+  for (const file of ["/src/app.js", "/src/researcher.js", "/src/storage.js", "/src/engine.js", "/src/summary.js", "/src/study-config.js"]) {
     const src = await (await page.request.get(file)).text();
     expect(src).not.toMatch(/getUserMedia|mediaDevices|getDisplayMedia|type="file"|type=file/);
   }
 });
 
-test("researcher dashboard: demo data, counts, export, dictionary, deletion", async ({ page }) => {
-  await page.goto("/researcher.html");
-  await expect(page.getByText("Preview mode", { exact: false }).first()).toBeVisible();
-  await page.getByRole("tab", { name: "Demo data" }).click();
-  await page.locator("#demo-count").fill("30");
-  await page.getByRole("button", { name: "Generate (replace demo set)" }).click();
-  await expect(page.getByText("Generated 30 synthetic demo records.")).toBeVisible();
-  const demo = await records(page);
-  expect(demo.length).toBe(30);
-  expect(demo.every((r) => r.record_kind === "synthetic_demo")).toBe(true);
-  expect(await records(page, RESEARCH_KEY)).toEqual([]);
-
-  await page.getByRole("tab", { name: "Overview" }).click();
-  await expect(page.getByRole("heading", { name: "Counts by condition and pathway" })).toBeVisible();
-  const totalCell = page.locator("table").first().locator("tbody tr").last().locator("th").last();
-  await expect(totalCell).toHaveText("30");
-  await expect(page.getByText("Research data (research mode not active)")).toBeDisabled();
-
-  await page.getByRole("tab", { name: "Records" }).click();
-  const code = (await page.locator("tbody tr").first().locator("td").first().textContent()).trim();
-  expect(code).toMatch(/^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
-
-  await page.getByRole("tab", { name: "Export" }).click();
-  const [download] = await Promise.all([page.waitForEvent("download"), page.getByRole("button", { name: /Download CSV/ }).click()]);
-  expect(download.suggestedFilename()).toMatch(/^agecheck-demo-v.*\.csv$/);
-  const [jsonDl] = await Promise.all([page.waitForEvent("download"), page.getByRole("button", { name: "Download JSON" }).click()]);
-  expect(jsonDl.suggestedFilename()).toMatch(/^agecheck-demo-v.*\.json$/);
-
-  await page.getByRole("tab", { name: "Data dictionary" }).click();
-  await expect(page.getByRole("cell", { name: "final_pathway" })).toBeVisible();
-  await expect(page.getByRole("cell", { name: "q_recall_notice" })).toBeVisible();
-
-  await page.getByRole("tab", { name: "Delete by code" }).click();
-  await page.locator("#delete-code").fill(code);
-  await page.getByRole("button", { name: "Delete", exact: true }).click();
-  await expect(page.getByText(`Deleted 1 record(s) with code ${code}.`)).toBeVisible();
-  expect((await records(page)).length).toBe(29);
-});
-
 test.describe("research mode", () => {
-  function researchConfig(adapter) {
-    const c = cloneConfig(DEFAULT_STUDY_CONFIG);
-    c.mode = "research";
-    c.frozen = true;
-    c.studyVersion = "1.0.0";
-    c.storage = { adapter, endpointUrl: "", submitToken: "" };
-    for (const k of Object.keys(c.consent)) {
-      if (typeof c.consent[k] === "string") c.consent[k] = c.consent[k].replace(/\[[^\]]*\]/g, "Filled wording for tests.");
-    }
-    return c;
-  }
-
-  test("collection is disabled until storage is configured", async ({ page }) => {
-    await page.goto("/index.html");
-    await page.evaluate(([k, cfg]) => localStorage.setItem(k, JSON.stringify(cfg)), [CONFIG_KEY, researchConfig("none")]);
+  test("a research configuration that fails its checks never runs participants", async ({ page }) => {
+    await setLocalConfig(page, researchConfig("none"));
     await page.goto("/index.html?reset=1");
-    await expect(page.getByRole("heading", { name: "Collection is not configured" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "This study page is not available right now" })).toBeVisible();
+    await expect(page.getByText("A storage configuration is required")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Continue" })).toHaveCount(0);
+    expect(await records(page, RESEARCH_KEY)).toEqual([]);
   });
 
   test("local-device research records are separate from demo records and ignore forced conditions", async ({ page }) => {
     await installSpies(page);
-    await page.goto("/index.html");
-    await page.evaluate(([k, cfg]) => localStorage.setItem(k, JSON.stringify(cfg)), [CONFIG_KEY, researchConfig("local-device")]);
+    await setLocalConfig(page, researchConfig("local-device"));
     await page.goto("/index.html?reset=1&condition=advance&failSubmit=1");
     await expect(page.getByText("Research mode", { exact: true })).toBeVisible();
     await expect(page.getByText("Preview mode", { exact: false })).toHaveCount(0);
@@ -493,6 +383,6 @@ test.describe("research mode", () => {
     await page.goto("/researcher.html");
     await expect(page.getByText("Research mode", { exact: false }).first()).toBeVisible();
     await page.getByRole("button", { name: "Research data" }).click();
-    await expect(page.getByText("1 research record(s) loaded.")).toBeVisible();
+    await expect(page.locator("#scope-line")).toContainText("Showing 1 of 1 research record");
   });
 });

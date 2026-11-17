@@ -47,6 +47,24 @@ for (const f of FIELDS) {
   out.push(`| \`${f.name}\` | ${f.type}${f.maxLength ? ` (max ${f.maxLength})` : ""} | ${values} | ${special} | ${f.measure || ""} | ${f.description.replace(/\|/g, "\\|")} |`);
 }
 out.push("");
+out.push("## How a stored record is updated");
+out.push("");
+out.push("There is one record per response, in the browser's stores and on the reference server alike. The same rule (`resolveSave` in `src/data-dictionary.js`) decides what is kept when a record arrives for a response that is already stored.");
+out.push("");
+out.push("| Rank | State of the record |");
+out.push("|---|---|");
+out.push("| 0 | Assigned at assent |");
+out.push("| 1 | Assigned verification screen displayed |");
+out.push("| 2 | Initial decision made |");
+out.push("| 3 | Uncertain result and ID prompt reached |");
+out.push("| 4 | ID decision made |");
+out.push("| 5 | Questionnaire submitted |");
+out.push("| 6 | Withdrawn |");
+out.push("");
+out.push("A record of higher rank replaces one of lower rank. A record of lower rank that arrives late is ignored, so a slow or repeated save never undoes newer progress and never creates a second record. A withdrawal therefore replaces everything, including a submitted record, and nothing replaces a withdrawal.");
+out.push("");
+out.push("When the withdrawal policy is to withhold responses, every store applies it to a withdrawn record before keeping it: decisions, questionnaire answers, timings, and any recruitment code become `withheld`, `q_stop_reasons` included, and `questionnaire_status` becomes `missing`. What remains is the fact of withdrawal, the condition, and the step reached. Draft answers that were never submitted are never part of any record.");
+out.push("");
 out.push("## Measures");
 out.push("");
 out.push("Perceived privacy risk (`q_risk_*`), perceived transparency (`q_transp_*`), unexpectedness (`q_id_*`), and notice recall (`q_recall_notice`) are stored item by item. The app computes no composite score, no reliability statistic, and no significance test. The questionnaire items are custom draft items written for this study, not a validated scale.");
